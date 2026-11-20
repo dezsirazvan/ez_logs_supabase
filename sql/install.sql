@@ -115,8 +115,11 @@ CREATE TABLE IF NOT EXISTS ezlogs.state (
   paused_until     timestamptz,
   last_reconciled  timestamptz,
   -- Rows dropped since install (too old, too many, or refused by EZLogs). Only grows.
-  dropped_total    bigint      NOT NULL DEFAULT 0
+  dropped_total    bigint      NOT NULL DEFAULT 0,
+  -- The empty post connect() sends, so EZLogs shows "Connected" at once; status() reads its reply.
+  hello_request_id bigint
 );
+ALTER TABLE ezlogs.state ADD COLUMN IF NOT EXISTS hello_request_id bigint;
 INSERT INTO ezlogs.state (one) VALUES (true) ON CONFLICT DO NOTHING;
 
 -- Tables a person took out with ezlogs.untrack(); nothing puts them back but ezlogs.track().
@@ -126,7 +129,7 @@ CREATE TABLE IF NOT EXISTS ezlogs.excluded (table_oid oid PRIMARY KEY);
 -- Constants
 -- ---------------------------------------------------------------------------------------
 
-CREATE OR REPLACE FUNCTION ezlogs.version() RETURNS text LANGUAGE sql IMMUTABLE AS $$ SELECT '1.0.0' $$;
+CREATE OR REPLACE FUNCTION ezlogs.version() RETURNS text LANGUAGE sql IMMUTABLE AS $$ SELECT '1.1.0' $$;
 
 -- Where data goes. A constant, never a setting: nothing inside the database can point the
 -- capture at another host.
@@ -135,7 +138,7 @@ CREATE OR REPLACE FUNCTION ezlogs.endpoint() RETURNS text LANGUAGE sql IMMUTABLE
 $$;
 
 CREATE OR REPLACE FUNCTION ezlogs.connected() RETURNS boolean LANGUAGE sql STABLE AS $$
-  SELECT EXISTS (SELECT 1 FROM ezlogs.state WHERE one AND supabase_url IS NOT NULL)
+  SELECT EXISTS (SELECT 1 FROM ezlogs.state WHERE one AND connected_at IS NOT NULL)
 $$;
 
 -- ---------------------------------------------------------------------------------------
@@ -640,7 +643,7 @@ DECLARE
   rid     bigint;
 BEGIN
   SELECT * INTO st FROM ezlogs.state WHERE one;
-  IF st.supabase_url IS NULL OR (st.paused_until IS NOT NULL AND st.paused_until > clock_timestamp()) THEN
+  IF st.connected_at IS NULL OR (st.paused_until IS NOT NULL AND st.paused_until > clock_timestamp()) THEN
     RETURN 0;
   END IF;
   SELECT decrypted_secret INTO key FROM vault.decrypted_secrets WHERE name = 'ezlogs_ingest_key' LIMIT 1;
@@ -728,7 +731,7 @@ BEGIN
     RETURN NULL;
   END IF;
   SELECT * INTO st FROM ezlogs.state WHERE one FOR UPDATE SKIP LOCKED;
-  IF NOT FOUND OR st.supabase_url IS NULL THEN
+  IF NOT FOUND OR st.connected_at IS NULL THEN
     RETURN NULL;
   END IF;
   IF st.last_sent_at IS NULL OR st.last_sent_at < clock_timestamp() - interval '1 second' THEN
@@ -859,7 +862,7 @@ BEGIN
   --    (A write that commits right after this check waits for the next write to ship.)
   SELECT * INTO st FROM ezlogs.state WHERE one;
   IF NOT EXISTS (SELECT 1 FROM ezlogs.outbox)
-     OR st.supabase_url IS NULL
+     OR st.connected_at IS NULL
      OR st.paused_until > clock_timestamp() + interval '10 minutes' THEN
     PERFORM cron.unschedule('ezlogs-flush');
   END IF;
@@ -872,14 +875,16 @@ $$;
 -- Connect, status, uninstall
 -- ---------------------------------------------------------------------------------------
 
--- Run once in the SQL editor with the database key from EZLogs and the project URL.
-CREATE OR REPLACE FUNCTION ezlogs.connect(p_key text, p_supabase_url text) RETURNS text
+-- Run once in the SQL editor with the database key from EZLogs (the install code EZLogs gives
+-- you ends with this line, key filled in). The project URL is optional.
+DROP FUNCTION IF EXISTS ezlogs.connect(text, text);
+CREATE OR REPLACE FUNCTION ezlogs.connect(p_key text, p_supabase_url text DEFAULT NULL) RETURNS text
   LANGUAGE plpgsql
   SECURITY DEFINER
   SET search_path = ezlogs, pg_temp
 AS $$
 DECLARE
-  url       text := rtrim(trim(p_supabase_url), '/');
+  url       text := NULLIF(rtrim(trim(p_supabase_url), '/'), '');
   secret_id uuid;
 BEGIN
   IF p_key IS NULL OR p_key !~ '^ezldb_[A-Za-z0-9_-]{20,}$' THEN
@@ -891,7 +896,7 @@ BEGIN
   IF to_regclass('cron.job') IS NULL THEN
     RAISE EXCEPTION 'EZLogs needs the pg_cron extension (Database, Extensions, pg_cron) to confirm deliveries.';
   END IF;
-  IF url !~ '^https://[a-z0-9-]+\.(supabase\.co|lovable\.cloud)$' THEN
+  IF url IS NOT NULL AND url !~ '^https://[a-z0-9-]+\.(supabase\.co|lovable\.cloud)$' THEN
     RAISE EXCEPTION 'Use the project URL, like https://abcd.supabase.co (Lovable Cloud: the VITE_SUPABASE_URL value).';
   END IF;
 
@@ -903,7 +908,7 @@ BEGIN
   END IF;
 
   UPDATE ezlogs.state
-     SET supabase_url = url, connected_at = now(), paused_until = NULL, failures = 0, last_error = NULL
+     SET supabase_url = COALESCE(url, supabase_url), connected_at = now(), paused_until = NULL, failures = 0, last_error = NULL
    WHERE one;
 
   -- Supabase's own tables.
@@ -920,6 +925,18 @@ BEGIN
   IF EXISTS (SELECT 1 FROM ezlogs.outbox) THEN
     PERFORM ezlogs.ensure_flush_job();
   END IF;
+
+  -- Say hello: an empty post, so EZLogs shows this database as connected before the app writes.
+  UPDATE ezlogs.state s
+     SET hello_request_id = net.http_post(
+           url                  := ezlogs.endpoint(),
+           body                 := jsonb_build_object('install_id', s.install_id, 'version', ezlogs.version(),
+                                                      'supabase_url', s.supabase_url, 'dropped_rows', s.dropped_total,
+                                                      'rows', '[]'::jsonb),
+           headers              := jsonb_build_object('Authorization', 'Bearer ' || p_key, 'Content-Type', 'application/json'),
+           timeout_milliseconds := 10000)
+   WHERE one;
+
   RETURN format('Connected. EZLogs now records changes to %s tables, sign-ups, sign-ins and files.',
                 (SELECT count(*) FROM pg_trigger WHERE tgname = 'ezlogs_capture' AND NOT tgisinternal
                    AND tgrelid IN (SELECT oid FROM pg_class WHERE relnamespace = 'public'::regnamespace)));
@@ -934,7 +951,7 @@ CREATE OR REPLACE FUNCTION ezlogs.status() RETURNS jsonb
 AS $$
   SELECT jsonb_build_object(
     'version',        ezlogs.version(),
-    'connected',      s.supabase_url IS NOT NULL,
+    'connected',      s.connected_at IS NOT NULL,
     'supabase_url',   s.supabase_url,
     'waiting_rows',   (SELECT count(*) FROM ezlogs.outbox),
     'tracked_tables', (SELECT count(*) FROM pg_trigger WHERE tgname = 'ezlogs_capture' AND NOT tgisinternal),
@@ -943,7 +960,9 @@ AS $$
     'last_error',     s.last_error,
     'paused_until',   s.paused_until,
     'dropped_total',  s.dropped_total,
-    'flush_job',      CASE WHEN to_regclass('cron.job') IS NULL THEN 'pg_cron not installed' END)
+    'flush_job',      CASE WHEN to_regclass('cron.job') IS NULL THEN 'pg_cron not installed' END,
+    -- EZLogs' answer to connect()'s hello: 202 = connected; 401 = wrong or revoked key.
+    'hello',          (SELECT COALESCE(r.status_code::text, r.error_msg) FROM net._http_response r WHERE r.id = s.hello_request_id))
   FROM ezlogs.state s WHERE s.one
 $$;
 

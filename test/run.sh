@@ -84,6 +84,11 @@ q "CREATE OR REPLACE FUNCTION ezlogs.endpoint() RETURNS text LANGUAGE sql IMMUTA
 check "a bad key is refused with a clear message" bash -c "! psql '$DB' -X -At -c \"select ezlogs.connect('ezl_wrongkind', 'https://abc.supabase.co')\" 2>/dev/null"
 KEY="ezldb_$(python3 -c 'import secrets;print(secrets.token_urlsafe(32))')"
 check "connect" q "select ezlogs.connect('$KEY', 'https://local-test.supabase.co')"
+wait_until "python3 -I -c \"import json,sys; sys.exit(0 if any(json.loads(l)['body']['rows']==[] for l in open('$LOG') if l.strip()) else 1)\"" 15
+expect "connect says hello at once (an empty post), before the app writes anything" "
+assert any(p['rows']==[] and p['install_id'] for p in posts), len(posts)"
+wait_until "[ \"\$(q \"select ezlogs.status()->>'hello'\")\" = 202 ]" 15
+check "status shows EZLogs' answer to the hello" test "$(q "select ezlogs.status()->>'hello'")" = 202
 check "the key is in Vault, not in a table" test "$(q "select count(*) from vault.decrypted_secrets where name = 'ezlogs_ingest_key' and decrypted_secret = '$KEY'")" = 1
 check "public tables, auth.users and storage.objects are tracked" test "$(q "select count(*) from pg_trigger where tgname = 'ezlogs_capture' and not tgisinternal")" -ge 4
 q "create table public.api_tokens (id bigserial primary key, value text)" >/dev/null
@@ -129,7 +134,7 @@ expect "an upload names the file and its owner" "
 o=[r for r in rows if r['schema']=='storage' and r['op']=='INSERT'][0]['new']
 assert o['bucket_id']=='files' and o['name'].startswith('$USER_ID/brief-') and o['owner_id']=='$USER_ID' and o['mimetype']=='text/plain', o"
 expect "every post names the install and the version" "
-assert all(p['version']=='1.0.0' and p['install_id'] and p['supabase_url']=='https://local-test.supabase.co' for p in posts)"
+assert all(p['version']=='1.1.0' and p['install_id'] and p['supabase_url']=='https://local-test.supabase.co' for p in posts)"
 check "the key travels only in the Authorization header" python3 -I -c "
 import json
 for l in open('$LOG'):
@@ -243,7 +248,8 @@ wait_until "[ \"\$(flush_job)\" = 0 ]" 15
 check "no job keeps an idle project awake while paused" test "$(flush_job)" = 0
 check "the row is kept for later" test "$(outbox)" -ge 1
 echo 202 > "$STATUS"
-q "select ezlogs.connect('$KEY', 'https://local-test.supabase.co')" >/dev/null   # reconnecting resumes
+q "select ezlogs.connect('$KEY')" >/dev/null   # reconnecting resumes (the project URL is optional and kept)
+check "reconnecting without the URL keeps it" test "$(q "select supabase_url from ezlogs.state")" = "https://local-test.supabase.co"
 q "insert into public.items(name) values ('after-reconnect')" >/dev/null
 wait_until "[ \"\$(outbox)\" = 0 ]" 30
 check "reconnecting resumes and sends what waited" test "$(outbox)" = 0
@@ -297,7 +303,7 @@ sizes=[len(json.dumps(json.loads(l)['body'])) for l in open('$LOG') if l.strip()
 assert sizes and max(sizes) < 65536, max(sizes)"
 
 echo "== status and uninstall"
-check "status reports the connection" python3 -I -c "import json,sys; s=json.loads(sys.argv[1]); assert s['connected'] and s['version']=='1.0.0' and s['waiting_rows']==0 and s['dropped_total']>=1, s" "$(q 'select ezlogs.status()')"
+check "status reports the connection" python3 -I -c "import json,sys; s=json.loads(sys.argv[1]); assert s['connected'] and s['version']=='1.1.0' and s['waiting_rows']==0 and s['dropped_total']>=1, s" "$(q 'select ezlogs.status()')"
 check "the table created before connect is tracked since" test "$(q "select count(*) from pg_trigger where tgname='ezlogs_capture' and tgrelid='public.pre_connect'::regclass")" = 1
 check "uninstall" q "select ezlogs.uninstall()"
 check "no triggers, no schema, no key, no job are left" test "$(q "select (select count(*) from pg_trigger where tgname='ezlogs_capture') + (select count(*) from pg_namespace where nspname='ezlogs') + (select count(*) from vault.secrets where name='ezlogs_ingest_key') + (select count(*) from cron.job where jobname='ezlogs-flush') + (select count(*) from pg_event_trigger where evtname='ezlogs_track_tables')")" = 0

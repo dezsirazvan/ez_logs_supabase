@@ -10,22 +10,36 @@ it a fit for apps built with Lovable, Bolt, v0 or by hand.
 
 ## Install
 
-Needs the `pg_net`, `pg_cron` and Vault extensions. All three ship with every Supabase and
-Lovable Cloud project; the migration enables them.
+One paste, no code in your app:
 
-1. Apply [`sql/install.sql`](sql/install.sql) as a migration. Paste it into your AI builder
-   ("add this as a migration") or into the Supabase SQL editor.
-2. In the **SQL editor**, connect it with your EZLogs database key and your project URL. Run this
-   once, and never put it in a migration file, because migrations end up in git:
+1. In EZLogs, open **Settings → API keys → Lovable · Bolt · Supabase** and press **Create install
+   code**. The code is this repository's [`sql/install.sql`](sql/install.sql) plus one
+   `select ezlogs.connect('ezldb_…');` line carrying your database key.
+2. Paste it into your project's **SQL editor** and press **Run**:
+   - Lovable: Cloud → Database → SQL editor;
+   - Bolt, v0 or your own project: the Supabase dashboard → SQL Editor.
+3. The EZLogs page switches to **Connected** within seconds.
 
-   ```sql
-   select ezlogs.connect('ezldb_...', 'https://<project>.supabase.co');
-   ```
+Use the SQL editor, not a chat with your AI builder. The key must not end up in your code or in
+git. It is an ingest-only key, but still yours. If your project logs every schema change
+(`log_statement = 'ddl'`, pgAudit), the pasted code, key included, lands in your project's own
+Postgres logs. Only you can read those. If that matters to you, run the install code without its
+last line, then the `connect` line on its own.
 
-   On Lovable Cloud, the URL is your `VITE_SUPABASE_URL`.
+**Updating:** run the latest [`sql/install.sql`](sql/install.sql) again, without a connect
+line. It upgrades in place and keeps your key and anything still waiting to be sent.
 
-Nothing is recorded until `connect` runs. Re-applying the migration upgrades in place. Rows
-still waiting to be sent are kept.
+**Keeping it in your migrations?** Add [`sql/install.sql`](sql/install.sql) as a migration;
+applying it again later upgrades in place and keeps anything still waiting to be sent. Then run
+the connect line once in the SQL editor, never in a migration:
+
+```sql
+select ezlogs.connect('ezldb_...');
+-- optional second argument: your project URL, e.g. 'https://<project>.supabase.co'
+```
+
+It needs the `pg_net`, `pg_cron` and Vault extensions. All three ship with every Supabase and
+Lovable Cloud project, and the install enables them. Nothing is recorded until `connect` runs.
 
 ## What is recorded
 
