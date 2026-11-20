@@ -1,0 +1,13 @@
+{
+  "name": "ezlogs-supabase-tests",
+  "private": true,
+  "type": "module",
+  "description": "End-to-end tests of sql/install.sql against a local Supabase stack (supabase CLI + Docker).",
+  "scripts": {
+    "test": "bash run.sh"
+  },
+  "devDependencies": {
+    "@supabase/supabase-js": "2.119.1",
+    "supabase": "3.2.0"
+  }
+}
