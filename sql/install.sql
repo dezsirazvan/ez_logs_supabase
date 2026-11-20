@@ -36,12 +36,27 @@
 --
 -- Remove everything with: select ezlogs.uninstall();
 
-CREATE EXTENSION IF NOT EXISTS pg_net WITH SCHEMA extensions;
+-- Robust on any Supabase host, now and when the host changes things:
+-- * functions are not checked against other objects at creation (what pg_dump does), so an
+--   optional extension or a changed Supabase table can't stop the install;
+-- * only extensions every host allows are named (Lovable's SQL editor refuses a whole script
+--   naming one outside its list); Supabase Vault ships installed on Supabase and Lovable Cloud,
+--   so it is not created here, and ezlogs.connect() says what is missing, if anything;
+-- * in the Supabase SQL editor the script is one transaction (it applies completely or not
+--   at all); running it again is always safe either way.
+SET check_function_bodies = false;
+
+-- In the `extensions` schema, as Supabase recommends (else its Security Advisor warns about an
+-- extension in public); plain if a project has no such schema.
 DO $$
 BEGIN
-  CREATE EXTENSION IF NOT EXISTS supabase_vault WITH SCHEMA vault;
+  BEGIN
+    CREATE EXTENSION IF NOT EXISTS pg_net WITH SCHEMA extensions;
+  EXCEPTION WHEN others THEN
+    CREATE EXTENSION IF NOT EXISTS pg_net;
+  END;
 EXCEPTION WHEN others THEN
-  RAISE NOTICE '[ezlogs] Supabase Vault not available (%); ezlogs.connect will explain', SQLERRM;
+  RAISE NOTICE '[ezlogs] pg_net not available (%); enable it before ezlogs.connect()', SQLERRM;
 END $$;
 
 -- pg_cron runs the flush job (confirmations, retries, cleanup). connect() requires it.
@@ -129,7 +144,7 @@ CREATE TABLE IF NOT EXISTS ezlogs.excluded (table_oid oid PRIMARY KEY);
 -- Constants
 -- ---------------------------------------------------------------------------------------
 
-CREATE OR REPLACE FUNCTION ezlogs.version() RETURNS text LANGUAGE sql IMMUTABLE AS $$ SELECT '1.1.0' $$;
+CREATE OR REPLACE FUNCTION ezlogs.version() RETURNS text LANGUAGE sql IMMUTABLE AS $$ SELECT '1.1.1' $$;
 
 -- Where data goes. A constant, never a setting: nothing inside the database can point the
 -- capture at another host.
@@ -368,24 +383,29 @@ EXCEPTION WHEN others THEN
 END;
 $$;
 
+DROP FUNCTION IF EXISTS ezlogs.auth_user_view(auth.users);
+DROP FUNCTION IF EXISTS ezlogs.storage_object_view(storage.objects);
+
 -- auth.users: a fixed list of columns, never the whole row (password hash, tokens and
 -- metadata stay out). Auth's own server writes this table; the row itself is the user.
-CREATE OR REPLACE FUNCTION ezlogs.auth_user_view(u auth.users) RETURNS jsonb
-  LANGUAGE sql STABLE
+-- Read through to_jsonb, never by column, so a column Supabase adds, renames or drops can't
+-- break the install or the capture (a missing column is simply absent).
+CREATE OR REPLACE FUNCTION ezlogs.auth_user_view(j jsonb) RETURNS jsonb
+  LANGUAGE sql IMMUTABLE
 AS $$
   SELECT jsonb_strip_nulls(jsonb_build_object(
-    'id',                 u.id,
-    'email',              u.email,
-    'phone',              u.phone,
-    'name',               left(COALESCE(u.raw_user_meta_data->>'full_name', u.raw_user_meta_data->>'name'), 200),
-    'created_at',         u.created_at,
-    'invited_at',         u.invited_at,
-    'email_confirmed_at', u.email_confirmed_at,
-    'phone_confirmed_at', u.phone_confirmed_at,
-    'last_sign_in_at',    u.last_sign_in_at,
-    'banned_until',       u.banned_until,
-    'deleted_at',         u.deleted_at,
-    'is_anonymous',       u.is_anonymous))
+    'id',                 j->'id',
+    'email',              j->'email',
+    'phone',              j->'phone',
+    'name',               left(COALESCE(j->'raw_user_meta_data'->>'full_name', j->'raw_user_meta_data'->>'name'), 200),
+    'created_at',         j->'created_at',
+    'invited_at',         j->'invited_at',
+    'email_confirmed_at', j->'email_confirmed_at',
+    'phone_confirmed_at', j->'phone_confirmed_at',
+    'last_sign_in_at',    j->'last_sign_in_at',
+    'banned_until',       j->'banned_until',
+    'deleted_at',         j->'deleted_at',
+    'is_anonymous',       j->'is_anonymous'))
 $$;
 
 CREATE OR REPLACE FUNCTION ezlogs.capture_auth_user() RETURNS trigger
@@ -397,8 +417,8 @@ DECLARE
   old_json jsonb;
   new_json jsonb;
 BEGIN
-  IF TG_OP <> 'INSERT' THEN old_json := ezlogs.auth_user_view(OLD); END IF;
-  IF TG_OP <> 'DELETE' THEN new_json := ezlogs.auth_user_view(NEW); END IF;
+  IF TG_OP <> 'INSERT' THEN old_json := ezlogs.auth_user_view(to_jsonb(OLD)); END IF;
+  IF TG_OP <> 'DELETE' THEN new_json := ezlogs.auth_user_view(to_jsonb(NEW)); END IF;
   IF TG_OP = 'UPDATE' AND old_json = new_json THEN
     RETURN NULL;
   END IF;
@@ -413,17 +433,17 @@ $$;
 
 -- storage.objects: which file, where, how big, whose. Storage writes as service_role, so the
 -- uploader is owner_id.
-CREATE OR REPLACE FUNCTION ezlogs.storage_object_view(o storage.objects) RETURNS jsonb
-  LANGUAGE sql STABLE
+CREATE OR REPLACE FUNCTION ezlogs.storage_object_view(j jsonb) RETURNS jsonb
+  LANGUAGE sql IMMUTABLE
 AS $$
   SELECT jsonb_strip_nulls(jsonb_build_object(
-    'id',         o.id,
-    'bucket_id',  o.bucket_id,
-    'name',       left(o.name, 500),
-    'owner_id',   o.owner_id,
-    'size',       o.metadata->>'size',
-    'mimetype',   o.metadata->>'mimetype',
-    'created_at', o.created_at))
+    'id',         j->'id',
+    'bucket_id',  j->'bucket_id',
+    'name',       left(j->>'name', 500),
+    'owner_id',   COALESCE(NULLIF(j->'owner_id', 'null'::jsonb), NULLIF(j->'owner', 'null'::jsonb)),
+    'size',       j->'metadata'->>'size',
+    'mimetype',   j->'metadata'->>'mimetype',
+    'created_at', j->'created_at'))
 $$;
 
 CREATE OR REPLACE FUNCTION ezlogs.capture_storage_object() RETURNS trigger
@@ -435,8 +455,8 @@ DECLARE
   old_json jsonb;
   new_json jsonb;
 BEGIN
-  IF TG_OP <> 'INSERT' THEN old_json := ezlogs.storage_object_view(OLD); END IF;
-  IF TG_OP <> 'DELETE' THEN new_json := ezlogs.storage_object_view(NEW); END IF;
+  IF TG_OP <> 'INSERT' THEN old_json := ezlogs.storage_object_view(to_jsonb(OLD)); END IF;
+  IF TG_OP <> 'DELETE' THEN new_json := ezlogs.storage_object_view(to_jsonb(NEW)); END IF;
   IF TG_OP = 'UPDATE' AND old_json = new_json THEN
     RETURN NULL;
   END IF;
@@ -896,6 +916,9 @@ BEGIN
   IF to_regclass('cron.job') IS NULL THEN
     RAISE EXCEPTION 'EZLogs needs the pg_cron extension (Database, Extensions, pg_cron) to confirm deliveries.';
   END IF;
+  IF to_regprocedure('net.http_post(text,jsonb,jsonb,jsonb,integer)') IS NULL THEN
+    RAISE EXCEPTION 'EZLogs needs the pg_net extension (Database, Extensions, pg_net) to send changes.';
+  END IF;
   IF url IS NOT NULL AND url !~ '^https://[a-z0-9-]+\.(supabase\.co|lovable\.cloud)$' THEN
     RAISE EXCEPTION 'Use the project URL, like https://abcd.supabase.co (Lovable Cloud: the VITE_SUPABASE_URL value).';
   END IF;
@@ -943,13 +966,25 @@ BEGIN
 END;
 $$;
 
--- What the install page and a person debugging need.
+-- What the install page and a person debugging need. Works whatever is missing.
 CREATE OR REPLACE FUNCTION ezlogs.status() RETURNS jsonb
-  LANGUAGE sql STABLE
+  LANGUAGE plpgsql STABLE
   SECURITY DEFINER
   SET search_path = ezlogs, pg_temp
 AS $$
-  SELECT jsonb_build_object(
+DECLARE
+  s     ezlogs.state%ROWTYPE;
+  hello text;
+BEGIN
+  SELECT * INTO s FROM ezlogs.state WHERE one;
+  IF to_regclass('net._http_response') IS NULL THEN
+    hello := 'pg_net not installed';
+  ELSIF s.hello_request_id IS NOT NULL THEN
+    -- EZLogs' answer to connect()'s hello: 202 = connected; 401 = wrong or revoked key.
+    EXECUTE 'SELECT COALESCE(status_code::text, error_msg) FROM net._http_response WHERE id = $1'
+       INTO hello USING s.hello_request_id;
+  END IF;
+  RETURN jsonb_build_object(
     'version',        ezlogs.version(),
     'connected',      s.connected_at IS NOT NULL,
     'supabase_url',   s.supabase_url,
@@ -961,9 +996,8 @@ AS $$
     'paused_until',   s.paused_until,
     'dropped_total',  s.dropped_total,
     'flush_job',      CASE WHEN to_regclass('cron.job') IS NULL THEN 'pg_cron not installed' END,
-    -- EZLogs' answer to connect()'s hello: 202 = connected; 401 = wrong or revoked key.
-    'hello',          (SELECT COALESCE(r.status_code::text, r.error_msg) FROM net._http_response r WHERE r.id = s.hello_request_id))
-  FROM ezlogs.state s WHERE s.one
+    'hello',          hello);
+END;
 $$;
 
 CREATE OR REPLACE FUNCTION ezlogs.uninstall() RETURNS text
@@ -1006,3 +1040,5 @@ END $$;
 
 -- Already connected (re-applying the migration to upgrade): refresh the triggers now.
 SELECT ezlogs.reconcile();
+
+RESET check_function_bodies;
