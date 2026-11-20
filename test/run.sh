@@ -112,7 +112,7 @@ check "everything was delivered and the outbox is empty" test "$(outbox)" = 0
 expect "rows carry the user, verified by Supabase" "
 mine=[r for r in rows if r['schema']=='public' and r['table']=='items' and (r.get('claims') or {}).get('sub')=='$USER_ID']
 assert len(mine)>=3, len(mine)
-c=mine[0]['claims']; assert c['role']=='authenticated' and c['email'].startswith('ana.') and c['name']=='Ana Test', c"
+c=mine[0]['claims']; assert c['role']=='authenticated' and c['email'].startswith('ana.') and c['name']=='Ana Test' and c['iss'].endswith('/auth/v1'), c"
 expect "the click's requests share the browser's correlation id" "
 tagged={(r['table'],r['op']) for r in rows if r.get('correlation_id')=='$CID'}
 assert {('items','INSERT'),('items','UPDATE'),('items','DELETE'),('objects','INSERT')} <= tagged, tagged"
@@ -134,7 +134,7 @@ expect "an upload names the file and its owner" "
 o=[r for r in rows if r['schema']=='storage' and r['op']=='INSERT'][0]['new']
 assert o['bucket_id']=='files' and o['name'].startswith('$USER_ID/brief-') and o['owner_id']=='$USER_ID' and o['mimetype']=='text/plain', o"
 expect "every post names the install and the version" "
-assert all(p['version']=='1.1.1' and p['install_id'] and p['supabase_url']=='https://local-test.supabase.co' for p in posts)"
+assert all(p['version']=='1.2.0' and p['install_id'] and p['supabase_url']=='https://local-test.supabase.co' for p in posts)"
 check "the key travels only in the Authorization header" python3 -I -c "
 import json
 for l in open('$LOG'):
@@ -303,7 +303,7 @@ sizes=[len(json.dumps(json.loads(l)['body'])) for l in open('$LOG') if l.strip()
 assert sizes and max(sizes) < 65536, max(sizes)"
 
 echo "== status and uninstall"
-check "status reports the connection" python3 -I -c "import json,sys; s=json.loads(sys.argv[1]); assert s['connected'] and s['version']=='1.1.1' and s['waiting_rows']==0 and s['dropped_total']>=1, s" "$(q 'select ezlogs.status()')"
+check "status reports the connection" python3 -I -c "import json,sys; s=json.loads(sys.argv[1]); assert s['connected'] and s['version']=='1.2.0' and s['waiting_rows']==0 and s['dropped_total']>=1, s" "$(q 'select ezlogs.status()')"
 check "the table created before connect is tracked since" test "$(q "select count(*) from pg_trigger where tgname='ezlogs_capture' and tgrelid='public.pre_connect'::regclass")" = 1
 check "uninstall" q "select ezlogs.uninstall()"
 check "no triggers, no schema, no key, no job are left" test "$(q "select (select count(*) from pg_trigger where tgname='ezlogs_capture') + (select count(*) from pg_namespace where nspname='ezlogs') + (select count(*) from vault.secrets where name='ezlogs_ingest_key') + (select count(*) from cron.job where jobname='ezlogs-flush') + (select count(*) from pg_event_trigger where evtname='ezlogs_track_tables')")" = 0

@@ -144,7 +144,7 @@ CREATE TABLE IF NOT EXISTS ezlogs.excluded (table_oid oid PRIMARY KEY);
 -- Constants
 -- ---------------------------------------------------------------------------------------
 
-CREATE OR REPLACE FUNCTION ezlogs.version() RETURNS text LANGUAGE sql IMMUTABLE AS $$ SELECT '1.1.1' $$;
+CREATE OR REPLACE FUNCTION ezlogs.version() RETURNS text LANGUAGE sql IMMUTABLE AS $$ SELECT '1.2.0' $$;
 
 -- Where data goes. A constant, never a setting: nothing inside the database can point the
 -- capture at another host.
@@ -240,7 +240,7 @@ $$;
 
 -- Who made this write, from what Supabase verified (PostgREST and storage set
 -- request.jwt.claims per request after checking the JWT): role, user id, email, name, the
--- OAuth client (an AI connected through Supabase's OAuth server), anonymous or not. Auth's own
+-- OAuth client (an AI connected through Supabase's OAuth server), the issuer, anonymous or not. Auth's own
 -- writes (sign-up, sign-in) carry none. Parsed once per transaction.
 CREATE OR REPLACE FUNCTION ezlogs.request_claims() RETURNS jsonb
   LANGUAGE plpgsql VOLATILE
@@ -274,6 +274,9 @@ BEGIN
       'email',        left(c->>'email', 200),
       'name',         left(COALESCE(c->'user_metadata'->>'full_name', c->'user_metadata'->>'name'), 200),
       'client_id',    left(c->>'client_id', 200),
+      -- The project's own auth address, from a token it signed: EZLogs checks browser reports'
+      -- logins only against this, never against an address a browser names.
+      'iss',          left(c->>'iss', 200),
       'is_anonymous', CASE WHEN jsonb_typeof(c->'is_anonymous') = 'boolean' THEN c->'is_anonymous' END
     )), '{}'::jsonb);
   END IF;

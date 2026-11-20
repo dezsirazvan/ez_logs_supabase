@@ -51,7 +51,8 @@ Lovable Cloud project, and the install enables them. Nothing is recorded until `
 
 **Who did it** comes from the login Supabase already verified for the request. That is a
 signed-in user, an anonymous visitor, your server using the service key, or an AI connected
-through Supabase's OAuth server.
+through Supabase's OAuth server. Each row also carries your project's auth address (the
+token's `iss`), so EZLogs can check logins reported by the browser against your project only.
 
 **Columns named like secrets** (password, token, secret, api_key, card number, cvv, pin, otp, …)
 are removed inside the database. They never leave it.
