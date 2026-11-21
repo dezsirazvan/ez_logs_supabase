@@ -145,7 +145,7 @@ CREATE TABLE IF NOT EXISTS ezlogs.excluded (table_oid oid PRIMARY KEY);
 -- Constants
 -- ---------------------------------------------------------------------------------------
 
-CREATE OR REPLACE FUNCTION ezlogs.version() RETURNS text LANGUAGE sql IMMUTABLE AS $$ SELECT '1.3.0' $$;
+CREATE OR REPLACE FUNCTION ezlogs.version() RETURNS text LANGUAGE sql IMMUTABLE AS $$ SELECT '1.3.1' $$;
 
 -- Where data goes. A constant, never a setting: nothing inside the database can point the
 -- capture at another host.
@@ -992,7 +992,7 @@ DECLARE
   secret_id uuid;
 BEGIN
   IF p_key IS NULL OR p_key !~ '^ezldb_[A-Za-z0-9_-]{20,}$' THEN
-    RAISE EXCEPTION 'That is not an EZLogs database key (they start with ezldb_). Create one in EZLogs: Settings, Install, Supabase.';
+    RAISE EXCEPTION 'That is not an EZLogs database key (they start with ezldb_). Copy the install code from EZLogs: Settings, API keys, the Lovable · Bolt · v0 tab. A key that starts with ezl_ is for the Rails or Next.js agent, not for a database.';
   END IF;
   IF to_regclass('vault.secrets') IS NULL THEN
     RAISE EXCEPTION 'Supabase Vault is not installed in this database; EZLogs keeps its key there.';
