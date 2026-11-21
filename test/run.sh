@@ -59,7 +59,7 @@ assert a and a == b, (a, b)"
 echo "== setup: a small app (tables, RLS, a storage bucket)"
 q "select ezlogs.uninstall()" >/dev/null 2>&1
 psql "$DB" -X -q -v ON_ERROR_STOP=1 <<'SQL' || { echo "app setup failed"; exit 1; }
-DROP TABLE IF EXISTS public.items, public.feedback, public.later_table, public.pre_connect, public.api_tokens, public.wide CASCADE;
+DROP TABLE IF EXISTS public.items, public.feedback, public.later_table, public.pre_connect, public.api_tokens, public.wide, public.invoices, public.bills, public."order-items" CASCADE;
 CREATE TABLE public.items (id bigserial PRIMARY KEY, name text UNIQUE NOT NULL, secret_token text,
                            settings jsonb, notes text, pairs jsonb[], created_by uuid DEFAULT auth.uid());
 ALTER TABLE public.items ENABLE ROW LEVEL SECURITY;
@@ -146,7 +146,7 @@ expect "an upload names the file and its owner" "
 o=[r for r in rows if r['schema']=='storage' and r['op']=='INSERT'][0]['new']
 assert o['bucket_id']=='files' and o['name'].startswith('$USER_ID/brief-') and o['owner_id']=='$USER_ID' and o['mimetype']=='text/plain', o"
 expect "every post names the install and the version" "
-assert all(p['version']=='1.3.1' and p['install_id'] and p['supabase_url']=='https://local-test.supabase.co' for p in posts)"
+assert all(p['version']=='1.4.0' and p['install_id'] and p['supabase_url']=='https://local-test.supabase.co' for p in posts)"
 check "the key travels only in the Authorization header" python3 -I -c "
 import json
 for l in open('$LOG'):
@@ -237,6 +237,30 @@ wait_until "[ \"\$(outbox)\" = 0 ]" 20
 check "reconcile does not re-attach an untracked table" test "$(q "select count(*) from pg_trigger where tgname='ezlogs_capture' and tgrelid='public.later_table'::regclass")" = 0
 q "select ezlogs.track('public.later_table')" >/dev/null
 check "track brings it back" test "$(q "select count(*) from pg_trigger where tgname='ezlogs_capture' and tgrelid='public.later_table'::regclass")" = 1
+
+echo "== naming records by a column"
+q "create table public.invoices (id bigserial primary key, reference text, amount_cents int, api_token text); grant all on public.invoices to service_role; grant usage on sequence public.invoices_id_seq to service_role;" >/dev/null
+check "name_records refuses a table that doesn't exist" bash -c "psql '$DB' -X -At -c \"select ezlogs.name_records('public.nope', 'reference')\" 2>&1 | grep -q 'there is no table public.nope'"
+check "name_records refuses a column that doesn't exist" bash -c "psql '$DB' -X -At -c \"select ezlogs.name_records('public.invoices', 'nope')\" 2>&1 | grep -q 'invoices has no column nope'"
+check "name_records refuses a table that isn't the app's own" bash -c "psql '$DB' -X -At -c \"select ezlogs.name_records('auth.users', 'email')\" 2>&1 | grep -q 'not one of the app'"
+q "create table public.\"order-items\" (id bigserial primary key, \"Item No\" text, sku text)" >/dev/null
+check "name_records refuses names EZLogs would not use, rather than silently naming nothing" bash -c "psql '$DB' -X -At -c \"select ezlogs.name_records('public.\\\"order-items\\\"', 'sku')\" 2>&1 | grep -q 'plain table and column name'"
+check "name_records refuses a column named like a secret" bash -c "psql '$DB' -X -At -c \"select ezlogs.name_records('public.invoices', 'api_token')\" 2>&1 | grep -q 'named like a secret'"
+check "name_records says what it set" test "$(q "select ezlogs.name_records('public.invoices', 'reference')")" = "public.invoices rows are named by reference"
+check "name_records can't be called over the API, signed in or not" bash -c "! curl -sf -X POST '$API_URL/rest/v1/rpc/name_records' -H 'apikey: $PUBLISHABLE_KEY' -H 'Content-Profile: ezlogs' -H 'Content-Type: application/json' -d '{\"target\":\"public.invoices\",\"column_name\":\"amount_cents\"}' >/dev/null && ! curl -sf -X POST '$API_URL/rest/v1/rpc/name_records' -H 'apikey: $PUBLISHABLE_KEY' -H 'Content-Type: application/json' -d '{\"target\":\"public.invoices\",\"column_name\":\"amount_cents\"}' >/dev/null"
+check "and the setting is unchanged by those attempts" test "$(q "select column_name from ezlogs.record_names")" = reference
+check "the guarded migration form runs, and runs again" q "DO \$\$ BEGIN IF to_regprocedure('ezlogs.name_records(text,text)') IS NOT NULL AND to_regclass('public.invoices') IS NOT NULL THEN PERFORM ezlogs.name_records('public.invoices', 'reference'); END IF; END \$\$;"
+check "the guarded form skips a table the project doesn't have" q "DO \$\$ BEGIN IF to_regprocedure('ezlogs.name_records(text,text)') IS NOT NULL AND to_regclass('public.missing') IS NOT NULL THEN PERFORM ezlogs.name_records('public.missing', 'reference'); END IF; END \$\$;"
+check "status lists it" test "$(q "select ezlogs.status()->'record_names'->>'public.invoices'")" = reference
+q "insert into public.invoices(reference, amount_cents) values ('INV-0042', 1200)" >/dev/null
+wait_until "[ \"\$(outbox)\" = 0 ]" 20
+expect "each post says how its tables' rows are named" "assert any(p.get('names', {}).get('public.invoices') == 'reference' and any(r['table'] == 'invoices' for r in p['rows']) for p in posts)"
+check "a NULL column goes back to the default" bash -c "psql '$DB' -X -At -c \"select ezlogs.name_records('public.invoices', NULL)\" | grep -q 'default columns again'"
+check "and leaves no setting" test "$(q "select ezlogs.status()->'record_names'")" = "{}"
+q "select ezlogs.name_records('public.invoices', 'reference')" >/dev/null
+q "alter table public.invoices rename to bills" >/dev/null
+check "a renamed table keeps its setting under its new name" test "$(q "select ezlogs.status()->'record_names'->>'public.bills'")" = reference
+q "alter table public.bills rename to invoices; select ezlogs.name_records('public.invoices', NULL)" >/dev/null
 
 echo "== EZLogs down, then back"
 echo 503 > "$STATUS"
@@ -337,8 +361,8 @@ wait_until "[ \"\$(outbox)\" = 0 ]" 30
 check "an upgrade sends the sessions still valid again (EZLogs keeps one per id)" test "$(outbox)" = 0
 
 echo "== status and uninstall"
-check "connect says which version is running" bash -c "psql '$DB' -X -At -c \"select ezlogs.connect('$KEY')\" | grep -q '^Connected (EZLogs 1.3.1)\. Now recording changes to '"
-check "status reports the connection" python3 -I -c "import json,sys; s=json.loads(sys.argv[1]); assert s['connected'] and s['version']=='1.3.1' and s['waiting_rows']==0 and s['dropped_total']>=1, s" "$(q 'select ezlogs.status()')"
+check "connect says which version is running" bash -c "psql '$DB' -X -At -c \"select ezlogs.connect('$KEY')\" | grep -q '^Connected (EZLogs 1.4.0)\. Now recording changes to '"
+check "status reports the connection" python3 -I -c "import json,sys; s=json.loads(sys.argv[1]); assert s['connected'] and s['version']=='1.4.0' and s['waiting_rows']==0 and s['dropped_total']>=1, s" "$(q 'select ezlogs.status()')"
 check "the table created before connect is tracked since" test "$(q "select count(*) from pg_trigger where tgname='ezlogs_capture' and tgrelid='public.pre_connect'::regclass")" = 1
 check "uninstall" q "select ezlogs.uninstall()"
 check "no triggers, no schema, no key, no job are left" test "$(q "select (select count(*) from pg_trigger where tgname='ezlogs_capture') + (select count(*) from pg_namespace where nspname='ezlogs') + (select count(*) from vault.secrets where name='ezlogs_ingest_key') + (select count(*) from cron.job where jobname='ezlogs-flush') + (select count(*) from pg_event_trigger where evtname='ezlogs_track_tables')")" = 0

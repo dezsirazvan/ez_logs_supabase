@@ -97,7 +97,27 @@ record". Reads are not recorded.
 select ezlogs.status();                    -- connected? waiting rows? last error?
 select ezlogs.untrack('public.audit_noise');  -- stop recording a table (stays off)
 select ezlogs.track('public.audit_noise');    -- record it again
+select ezlogs.name_records('public.invoices', 'reference');  -- name its rows by that column
+select ezlogs.name_records('public.invoices', NULL);         -- back to the default columns
 select ezlogs.uninstall();                 -- remove triggers, job, key and schema
+```
+
+### Names for records
+
+A row is named by its own `name`, `title`, `number` or `label` column (or `<table>_number`), the
+same as the Rails and Next.js agents; a table with none shows its rows by their short id
+(`#b38a…a236`). `ezlogs.name_records` names a table's rows by another column: EZLogs then shows
+"Updated invoice 'INV-0042'". It refuses a column named like a secret (never sent), and changes
+nothing in your app's writes: the setting is read when rows are sent. Never pick an email or a phone
+number: names show on shared links. In a migration, guard it so a copy of the project without
+EZLogs still applies:
+
+```sql
+DO $$ BEGIN
+  IF to_regprocedure('ezlogs.name_records(text,text)') IS NOT NULL AND to_regclass('public.invoices') IS NOT NULL THEN
+    PERFORM ezlogs.name_records('public.invoices', 'reference');
+  END IF;
+END $$;
 ```
 
 ## Tests

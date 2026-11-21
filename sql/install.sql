@@ -136,16 +136,24 @@ CREATE TABLE IF NOT EXISTS ezlogs.state (
   hello_request_id bigint
 );
 ALTER TABLE ezlogs.state ADD COLUMN IF NOT EXISTS hello_request_id bigint;
+-- {"public.invoices": "reference"}: ezlogs.record_names as each post sends it, kept here so sending
+-- (which also runs at commit) reads no other table. Refreshed by name_records and schema changes.
+ALTER TABLE ezlogs.state ADD COLUMN IF NOT EXISTS record_names jsonb NOT NULL DEFAULT '{}'::jsonb;
 INSERT INTO ezlogs.state (one) VALUES (true) ON CONFLICT DO NOTHING;
 
 -- Tables a person took out with ezlogs.untrack(); nothing puts them back but ezlogs.track().
 CREATE TABLE IF NOT EXISTS ezlogs.excluded (table_oid oid PRIMARY KEY);
 
+-- The column a person recognises a table's rows by, set with ezlogs.name_records() when the
+-- table has no name, title, number or label column. Copied to ezlogs.state.record_names, which
+-- each post carries: EZLogs names each row from that column of the row it already got.
+CREATE TABLE IF NOT EXISTS ezlogs.record_names (table_oid oid PRIMARY KEY, column_name text NOT NULL);
+
 -- ---------------------------------------------------------------------------------------
 -- Constants
 -- ---------------------------------------------------------------------------------------
 
-CREATE OR REPLACE FUNCTION ezlogs.version() RETURNS text LANGUAGE sql IMMUTABLE AS $$ SELECT '1.3.1' $$;
+CREATE OR REPLACE FUNCTION ezlogs.version() RETURNS text LANGUAGE sql IMMUTABLE AS $$ SELECT '1.4.0' $$;
 
 -- Where data goes. A constant, never a setting: nothing inside the database can point the
 -- capture at another host.
@@ -586,6 +594,78 @@ END;
 $$;
 
 -- For people: stop recording a table, for good (until ezlogs.track). Survives renames.
+-- Name a table's rows by one of its columns, for a table with no name, title, number or label
+-- column (those already name rows): select ezlogs.name_records('public.invoices', 'number');
+-- A NULL column goes back to the default. Refuses a table or column that doesn't exist, and a
+-- column named like a secret (never sent, so it can't name anything). Safe in a migration:
+--   DO $$ BEGIN IF to_regprocedure('ezlogs.name_records(text,text)') IS NOT NULL
+--     AND to_regclass('public.invoices') IS NOT NULL THEN
+--     PERFORM ezlogs.name_records('public.invoices', 'number'); END IF; END $$;
+CREATE OR REPLACE FUNCTION ezlogs.name_records(target text, column_name text) RETURNS text
+  LANGUAGE plpgsql
+  SECURITY DEFINER
+  SET search_path = ezlogs, pg_temp
+AS $$
+DECLARE
+  t   regclass := to_regclass(target);
+  rel pg_class%ROWTYPE;
+BEGIN
+  IF t IS NULL THEN
+    RAISE EXCEPTION 'ezlogs.name_records: there is no table %', target
+      USING HINT = 'Write it as schema.table, for example ''public.invoices''.';
+  END IF;
+  SELECT * INTO rel FROM pg_class WHERE oid = t;
+  -- The tables EZLogs records (as ezlogs.attach): the app's own, in public, never one partition.
+  IF rel.relnamespace <> 'public'::regnamespace OR rel.relkind NOT IN ('r', 'p') OR rel.relispartition THEN
+    RAISE EXCEPTION 'ezlogs.name_records: % is not one of the app''s tables EZLogs records (a table in public)', t;
+  END IF;
+  IF column_name IS NULL THEN
+    DELETE FROM ezlogs.record_names WHERE table_oid = t;
+    PERFORM ezlogs.refresh_record_names();
+    RETURN format('%s rows are named by their default columns again (name, title, number, label)', t);
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_attribute
+                  WHERE attrelid = t AND attname = column_name AND attnum > 0 AND NOT attisdropped) THEN
+    RAISE EXCEPTION 'ezlogs.name_records: % has no column %', t, column_name;
+  END IF;
+  -- EZLogs takes plain names only (letters, digits, _), so a setting never silently names nothing.
+  IF rel.relname !~ '^[A-Za-z_][A-Za-z0-9_$]{0,62}$' OR column_name !~ '^[A-Za-z_][A-Za-z0-9_$]{0,62}$' THEN
+    RAISE EXCEPTION 'ezlogs.name_records: EZLogs names rows only by a plain table and column name (letters, digits and _)';
+  END IF;
+  IF ezlogs.is_sensitive_key(column_name) THEN
+    RAISE EXCEPTION 'ezlogs.name_records: % is named like a secret, so EZLogs never receives it and it can''t name rows', column_name;
+  END IF;
+  INSERT INTO ezlogs.record_names (table_oid, column_name) VALUES (t, column_name)
+    ON CONFLICT (table_oid) DO UPDATE SET column_name = EXCLUDED.column_name;
+  PERFORM ezlogs.refresh_record_names();
+  RETURN format('%s rows are named by %s', t, column_name);
+END;
+$$;
+
+-- {"public.invoices": "number"}, for the tables that still exist (at most 200).
+CREATE OR REPLACE FUNCTION ezlogs.record_names_json() RETURNS jsonb
+  LANGUAGE sql STABLE
+  SECURITY DEFINER
+  SET search_path = ezlogs, pg_temp
+AS $$
+  SELECT COALESCE(jsonb_object_agg(k, v), '{}'::jsonb) FROM (
+    SELECT n.nspname || '.' || c.relname AS k, r.column_name AS v
+      FROM ezlogs.record_names r
+      JOIN pg_class c ON c.oid = r.table_oid
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+     ORDER BY 1 LIMIT 200) named;
+$$;
+
+-- Copy the names to ezlogs.state (by current table name: a rename is a schema change, which
+-- refreshes them). Never called while the app writes.
+CREATE OR REPLACE FUNCTION ezlogs.refresh_record_names() RETURNS void
+  LANGUAGE sql
+  SECURITY DEFINER
+  SET search_path = ezlogs, pg_temp
+AS $$
+  UPDATE ezlogs.state SET record_names = ezlogs.record_names_json() WHERE one;
+$$;
+
 CREATE OR REPLACE FUNCTION ezlogs.untrack(target regclass) RETURNS void
   LANGUAGE plpgsql
   SECURITY DEFINER
@@ -695,6 +775,15 @@ BEGIN
   LOOP
     PERFORM ezlogs.attach(r.objid::regclass);
   END LOOP;
+  -- A renamed table keeps its name setting under its new name. Its own block: a failure here
+  -- never undoes the tracking above.
+  BEGIN
+    IF EXISTS (SELECT 1 FROM ezlogs.record_names) THEN
+      PERFORM ezlogs.refresh_record_names();
+    END IF;
+  EXCEPTION WHEN others THEN
+    RAISE WARNING '[ezlogs] could not refresh record names (the next name_records does): %', SQLERRM;
+  END;
 EXCEPTION WHEN others THEN
   RAISE WARNING '[ezlogs] could not track a new table (it is picked up later): %', SQLERRM;
 END;
@@ -740,6 +829,7 @@ DECLARE
   ids     bigint[];
   payload jsonb;
   rid     bigint;
+  names   jsonb;
 BEGIN
   SELECT * INTO st FROM ezlogs.state WHERE one;
   IF st.connected_at IS NULL OR (st.paused_until IS NOT NULL AND st.paused_until > clock_timestamp()) THEN
@@ -750,11 +840,18 @@ BEGIN
     RETURN 0;
   END IF;
 
-  SELECT array_agg(id ORDER BY id) INTO ids FROM (
-    SELECT c.id, c.bytes, sum(c.bytes) OVER (ORDER BY c.id) AS running
-      FROM (SELECT o.id, octet_length(ezlogs.row_json(o)::text) + 2 AS bytes
-              FROM ezlogs.outbox o WHERE o.request_id IS NULL ORDER BY o.id LIMIT 500) c) s
-   WHERE s.running <= 49152;
+  -- The names ride in every post (read from state, already loaded): their bytes come out of the
+  -- rows' 48 KB. When even the oldest row fits only alone, that post goes without names.
+  names := st.record_names;
+  LOOP
+    SELECT array_agg(id ORDER BY id) INTO ids FROM (
+      SELECT c.id, c.bytes, sum(c.bytes) OVER (ORDER BY c.id) AS running
+        FROM (SELECT o.id, octet_length(ezlogs.row_json(o)::text) + 2 AS bytes
+                FROM ezlogs.outbox o WHERE o.request_id IS NULL ORDER BY o.id LIMIT 500) c) s
+     WHERE s.running <= 49152 - octet_length(names::text);
+    EXIT WHEN ids IS NOT NULL OR names = '{}'::jsonb;
+    names := '{}'::jsonb;
+  END LOOP;
   IF ids IS NULL THEN
     -- The oldest row alone is over the limit (enqueue keeps rows under 41 KB, so only a row
     -- written by an older version can be): drop and count it rather than block everything.
@@ -770,6 +867,7 @@ BEGIN
            'version',      ezlogs.version(),
            'supabase_url', st.supabase_url,
            'dropped_rows', st.dropped_total,
+           'names',        names,
            'rows', jsonb_agg(ezlogs.row_json(o) ORDER BY o.id))
     INTO payload
     FROM ezlogs.outbox o WHERE o.id = ANY(ids);
@@ -1073,7 +1171,8 @@ BEGIN
     'paused_until',   s.paused_until,
     'dropped_total',  s.dropped_total,
     'flush_job',      CASE WHEN to_regclass('cron.job') IS NULL THEN 'pg_cron not installed' END,
-    'hello',          hello);
+    'hello',          hello,
+    'record_names',   s.record_names);
 END;
 $$;
 
@@ -1097,6 +1196,9 @@ BEGIN
   RETURN 'EZLogs removed: triggers, job, key and the ezlogs schema are gone.';
 END;
 $$;
+
+-- Re-applying this file keeps the names each post carries in step with ezlogs.record_names.
+SELECT ezlogs.refresh_record_names();
 
 -- Nothing in this schema is callable by the API roles. The capture and ship functions run
 -- from triggers as their owner; connect / status / uninstall are for the SQL editor.
