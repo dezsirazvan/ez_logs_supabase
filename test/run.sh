@@ -79,6 +79,10 @@ echo "== install"
 check "install applies cleanly" psql "$DB" -X -q -v ON_ERROR_STOP=1 -f "$INSTALL"
 check "re-applying (upgrade) is clean too" psql "$DB" -X -q -v ON_ERROR_STOP=1 -f "$INSTALL"
 q "create table public.pre_connect (id bigserial primary key, label text); insert into public.pre_connect(label) values ('before connect')" >/dev/null
+# Someone already signed in before the install: their session must be named once connect runs.
+q "delete from auth.sessions where id = '00000000-0000-0000-0000-00000000005e'; delete from auth.users where id = '00000000-0000-0000-0000-0000000000ee';
+   insert into auth.users (id, aud, role, email) values ('00000000-0000-0000-0000-0000000000ee', 'authenticated', 'authenticated', 'pre@example.com');
+   insert into auth.sessions (id, user_id, created_at) values ('00000000-0000-0000-0000-00000000005e', '00000000-0000-0000-0000-0000000000ee', now())" >/dev/null
 check "nothing is recorded before connect" test "$(q "select (select count(*) from ezlogs.outbox) + (select count(*) from pg_trigger where tgname='ezlogs_capture')")" = 0
 q "CREATE OR REPLACE FUNCTION ezlogs.endpoint() RETURNS text LANGUAGE sql IMMUTABLE AS \$\$ SELECT '$ENDPOINT' \$\$" >/dev/null
 check "a bad key is refused with a clear message" bash -c "! psql '$DB' -X -At -c \"select ezlogs.connect('ezl_wrongkind', 'https://abc.supabase.co')\" 2>/dev/null"
@@ -130,11 +134,18 @@ assert set(u[0]['new']) <= {'id','email','phone','name','created_at','invited_at
 assert u[0]['new']['name']=='Ana Test'"
 expect "sign-in shows as last_sign_in_at changing" "
 assert any(r['table']=='users' and r['op']=='UPDATE' and (r['old'] or {}).get('last_sign_in_at')!=(r['new'] or {}).get('last_sign_in_at') for r in rows)"
+expect "a sign-in sends its new session: its id and user only" "
+s=[r for r in rows if r['schema']=='auth' and r['table']=='sessions' and (r.get('new') or {}).get('user_id')=='$USER_ID']
+assert s and all(r['op']=='INSERT' for r in s), s
+assert all(set(r['new']) <= {'id','user_id','created_at'} for r in s), s[0]['new']"
+expect "a session from before the install is sent once, id and user only" "
+s=[r for r in rows if r['table']=='sessions' and r['resource_id']=='00000000-0000-0000-0000-00000000005e']
+assert len(s)==1 and s[0]['new']=={'id':'00000000-0000-0000-0000-00000000005e','user_id':'00000000-0000-0000-0000-0000000000ee','created_at':s[0]['new']['created_at']}, s"
 expect "an upload names the file and its owner" "
 o=[r for r in rows if r['schema']=='storage' and r['op']=='INSERT'][0]['new']
 assert o['bucket_id']=='files' and o['name'].startswith('$USER_ID/brief-') and o['owner_id']=='$USER_ID' and o['mimetype']=='text/plain', o"
 expect "every post names the install and the version" "
-assert all(p['version']=='1.2.0' and p['install_id'] and p['supabase_url']=='https://local-test.supabase.co' for p in posts)"
+assert all(p['version']=='1.3.0' and p['install_id'] and p['supabase_url']=='https://local-test.supabase.co' for p in posts)"
 check "the key travels only in the Authorization header" python3 -I -c "
 import json
 for l in open('$LOG'):
@@ -302,9 +313,31 @@ import json
 sizes=[len(json.dumps(json.loads(l)['body'])) for l in open('$LOG') if l.strip()]
 assert sizes and max(sizes) < 65536, max(sizes)"
 
+echo "== one of Supabase's tables can't be tracked: the others still are"
+q "drop trigger ezlogs_capture on auth.users; drop trigger ezlogs_capture on storage.objects; drop trigger ezlogs_capture on auth.sessions;
+   drop function ezlogs.capture_auth_session()" >/dev/null
+q "select ezlogs.attach_platform()" >/dev/null 2>&1
+check "accounts and files are tracked though sessions could not be" test "$(q "select string_agg(tgrelid::regclass::text, ',' order by tgrelid::regclass::text) from pg_trigger where tgname='ezlogs_capture' and tgrelid in ('auth.users'::regclass, 'storage.objects'::regclass, 'auth.sessions'::regclass)")" = "auth.users,storage.objects"
+psql "$DB" -X -q -v ON_ERROR_STOP=1 -f "$INSTALL" >/dev/null   # restores the function, and the endpoint
+q "CREATE OR REPLACE FUNCTION ezlogs.endpoint() RETURNS text LANGUAGE sql IMMUTABLE AS \$\$ SELECT '$ENDPOINT' \$\$" >/dev/null
+check "and sessions are tracked once they can be" test "$(q "select count(*) from pg_trigger where tgname='ezlogs_capture' and tgrelid='auth.sessions'::regclass")" = 1
+
+echo "== upgrade from a version without sessions"
+echo 202 > "$STATUS"                          # EZLogs answers normally again
+q "select ezlogs.connect('$KEY')" >/dev/null   # resume after the 401 drill above
+wait_until "[ \"\$(outbox)\" = 0 ]" 30
+q "drop trigger ezlogs_capture on auth.sessions" >/dev/null
+check "re-applying the install (no connect) starts reading sessions" bash -c "psql '$DB' -X -q -v ON_ERROR_STOP=1 -f '$INSTALL' && test \"\$(psql '$DB' -X -At -c \"select count(*) from pg_trigger where tgname='ezlogs_capture' and tgrelid='auth.sessions'::regclass\")\" = 1"
+# Re-applying restores the real endpoint (app.ezlogs.io, which refuses this test key): point it
+# back at the test receiver and resume.
+q "CREATE OR REPLACE FUNCTION ezlogs.endpoint() RETURNS text LANGUAGE sql IMMUTABLE AS \$\$ SELECT '$ENDPOINT' \$\$" >/dev/null
+q "select ezlogs.connect('$KEY')" >/dev/null
+wait_until "[ \"\$(outbox)\" = 0 ]" 30
+check "an upgrade sends the sessions still valid again (EZLogs keeps one per id)" test "$(outbox)" = 0
+
 echo "== status and uninstall"
-check "connect says which version is running" bash -c "psql '$DB' -X -At -c \"select ezlogs.connect('$KEY')\" | grep -q '^Connected (EZLogs 1.2.0)\. Now recording changes to '"
-check "status reports the connection" python3 -I -c "import json,sys; s=json.loads(sys.argv[1]); assert s['connected'] and s['version']=='1.2.0' and s['waiting_rows']==0 and s['dropped_total']>=1, s" "$(q 'select ezlogs.status()')"
+check "connect says which version is running" bash -c "psql '$DB' -X -At -c \"select ezlogs.connect('$KEY')\" | grep -q '^Connected (EZLogs 1.3.0)\. Now recording changes to '"
+check "status reports the connection" python3 -I -c "import json,sys; s=json.loads(sys.argv[1]); assert s['connected'] and s['version']=='1.3.0' and s['waiting_rows']==0 and s['dropped_total']>=1, s" "$(q 'select ezlogs.status()')"
 check "the table created before connect is tracked since" test "$(q "select count(*) from pg_trigger where tgname='ezlogs_capture' and tgrelid='public.pre_connect'::regclass")" = 1
 check "uninstall" q "select ezlogs.uninstall()"
 check "no triggers, no schema, no key, no job are left" test "$(q "select (select count(*) from pg_trigger where tgname='ezlogs_capture') + (select count(*) from pg_namespace where nspname='ezlogs') + (select count(*) from vault.secrets where name='ezlogs_ingest_key') + (select count(*) from cron.job where jobname='ezlogs-flush') + (select count(*) from pg_event_trigger where evtname='ezlogs_track_tables')")" = 0

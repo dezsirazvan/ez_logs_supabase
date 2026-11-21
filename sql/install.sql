@@ -10,7 +10,8 @@
 --
 -- What it does:
 --   * an AFTER trigger on every table in `public` (new tables are picked up), on auth.users
---     (sign-ups, sign-ins, account changes) and on storage.objects (files), writing one row
+--     (sign-ups, sign-ins, account changes), on auth.sessions (a new session's id and user only)
+--     and on storage.objects (files), writing one row
 --     per change into ezlogs.outbox, with sensitive columns removed (inside json too) and very
 --     large values cut;
 --   * who did it comes from the login Supabase already verified (request.jwt.claims);
@@ -144,7 +145,7 @@ CREATE TABLE IF NOT EXISTS ezlogs.excluded (table_oid oid PRIMARY KEY);
 -- Constants
 -- ---------------------------------------------------------------------------------------
 
-CREATE OR REPLACE FUNCTION ezlogs.version() RETURNS text LANGUAGE sql IMMUTABLE AS $$ SELECT '1.2.0' $$;
+CREATE OR REPLACE FUNCTION ezlogs.version() RETURNS text LANGUAGE sql IMMUTABLE AS $$ SELECT '1.3.0' $$;
 
 -- Where data goes. A constant, never a setting: nothing inside the database can point the
 -- capture at another host.
@@ -274,8 +275,7 @@ BEGIN
       'email',        left(c->>'email', 200),
       'name',         left(COALESCE(c->'user_metadata'->>'full_name', c->'user_metadata'->>'name'), 200),
       'client_id',    left(c->>'client_id', 200),
-      -- The project's own auth address, from a token it signed: EZLogs checks browser reports'
-      -- logins only against this, never against an address a browser names.
+      -- The project's own auth address, from a token it signed: which Supabase project this is.
       'iss',          left(c->>'iss', 200),
       'is_anonymous', CASE WHEN jsonb_typeof(c->'is_anonymous') = 'boolean' THEN c->'is_anonymous' END
     )), '{}'::jsonb);
@@ -434,6 +434,30 @@ EXCEPTION WHEN others THEN
 END;
 $$;
 
+-- auth.sessions: only a new session's id and whose it is, never anything else (no tokens, no IP,
+-- no user agent). EZLogs keeps them apart, never as actions: they let a failure the person's
+-- browser reports (@ezlogs/browser sends only the session id, never a token) be named from what
+-- this database recorded.
+CREATE OR REPLACE FUNCTION ezlogs.capture_auth_session() RETURNS trigger
+  LANGUAGE plpgsql
+  SECURITY DEFINER
+  SET search_path = ezlogs, pg_temp
+AS $$
+DECLARE
+  j jsonb;
+BEGIN
+  j := to_jsonb(NEW);
+  PERFORM ezlogs.enqueue('auth', 'sessions', 'INSERT', NULL,
+                         jsonb_strip_nulls(jsonb_build_object('id', j->'id', 'user_id', j->'user_id', 'created_at', j->'created_at')),
+                         j->>'id');
+  RETURN NULL;
+EXCEPTION WHEN others THEN
+  -- An error here must never block a sign-in.
+  RAISE WARNING '[ezlogs] capture on auth.sessions failed (sign-in continues): %', SQLERRM;
+  RETURN NULL;
+END;
+$$;
+
 -- storage.objects: which file, where, how big, whose. Storage writes as service_role, so the
 -- uploader is owner_id.
 CREATE OR REPLACE FUNCTION ezlogs.storage_object_view(j jsonb) RETURNS jsonb
@@ -575,6 +599,57 @@ $$;
 
 -- Track every public table (new ones, and ones whose columns changed). Runs at connect, on
 -- schema changes, and from the flush job at most every 10 minutes. Nothing before connect().
+-- Supabase's own tables (accounts, sessions, files), each when it exists. Called by connect and by
+-- reconcile, so re-applying this file to upgrade also adds a table a newer version reads.
+CREATE OR REPLACE FUNCTION ezlogs.attach_platform() RETURNS void
+  LANGUAGE plpgsql
+  SECURITY DEFINER
+  SET search_path = ezlogs, pg_temp
+AS $$
+BEGIN
+  -- Each table on its own: one that can't be tracked now never undoes the others.
+  BEGIN
+    IF to_regclass('auth.users') IS NOT NULL
+       AND NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'ezlogs_capture' AND tgrelid = 'auth.users'::regclass) THEN
+      CREATE TRIGGER ezlogs_capture AFTER INSERT OR UPDATE OR DELETE ON auth.users
+        FOR EACH ROW EXECUTE FUNCTION ezlogs.capture_auth_user();
+    END IF;
+  EXCEPTION WHEN others THEN
+    RAISE WARNING '[ezlogs] could not track auth.users now (retried later): %', SQLERRM;
+  END;
+  BEGIN
+    IF to_regclass('storage.objects') IS NOT NULL
+       AND NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'ezlogs_capture' AND tgrelid = 'storage.objects'::regclass) THEN
+      CREATE TRIGGER ezlogs_capture AFTER INSERT OR UPDATE OR DELETE ON storage.objects
+        FOR EACH ROW EXECUTE FUNCTION ezlogs.capture_storage_object();
+    END IF;
+  EXCEPTION WHEN others THEN
+    RAISE WARNING '[ezlogs] could not track storage.objects now (retried later): %', SQLERRM;
+  END;
+  BEGIN
+    IF to_regclass('auth.sessions') IS NOT NULL
+       AND has_table_privilege('auth.sessions', 'TRIGGER')
+       AND NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'ezlogs_capture' AND tgrelid = 'auth.sessions'::regclass) THEN
+      -- People already signed in keep their session for weeks: send the newest sessions once (id and
+      -- user only, at most 20,000). Read before the trigger exists, so the read holds up no sign-in;
+      -- the trigger's lock then lasts until this transaction commits (well under a second). A
+      -- sign-in that commits between the read and the trigger is missed: that person is named again
+      -- from their next sign-in.
+      INSERT INTO ezlogs.outbox (schema_name, table_name, op, old_row, new_row, resource_id)
+      SELECT 'auth', 'sessions', 'INSERT', NULL,
+             jsonb_strip_nulls(jsonb_build_object('id', se.id, 'user_id', se.user_id, 'created_at', se.created_at)), se.id::text
+        FROM auth.sessions se
+       ORDER BY se.created_at DESC NULLS LAST
+       LIMIT 20000;
+      CREATE TRIGGER ezlogs_capture AFTER INSERT ON auth.sessions
+        FOR EACH ROW EXECUTE FUNCTION ezlogs.capture_auth_session();
+    END IF;
+  EXCEPTION WHEN others THEN
+    RAISE WARNING '[ezlogs] could not track auth.sessions now (retried later): %', SQLERRM;
+  END;
+END;
+$$;
+
 CREATE OR REPLACE FUNCTION ezlogs.reconcile() RETURNS int
   LANGUAGE plpgsql
   SECURITY DEFINER
@@ -587,6 +662,7 @@ BEGIN
   IF NOT ezlogs.connected() THEN
     RETURN 0;
   END IF;
+  PERFORM ezlogs.attach_platform();
   FOR t IN SELECT c.oid::regclass FROM pg_class c
             WHERE c.relnamespace = 'public'::regnamespace AND c.relkind IN ('r', 'p') AND NOT c.relispartition
   LOOP
@@ -822,6 +898,11 @@ BEGIN
       UPDATE ezlogs.state SET dropped_total = dropped_total + (SELECT count(*) FROM gone),
                               last_status = resp.status_code, last_error = 'EZLogs refused a batch (HTTP ' || resp.status_code || ')'
        WHERE one;
+    ELSIF st.connected_at IS NOT NULL AND EXISTS (SELECT 1 FROM ezlogs.outbox
+                       WHERE request_id = resp.id AND sent_at <= resp.created AND sent_at < st.connected_at) THEN
+      -- Sent before the last connect() (a revoked key reconnected): send its rows again, but this
+      -- answer was for the old connection and never pauses the new one.
+      UPDATE ezlogs.outbox SET request_id = NULL, sent_at = NULL WHERE request_id = resp.id AND sent_at <= resp.created;
     ELSE
       UPDATE ezlogs.outbox SET request_id = NULL, sent_at = NULL WHERE request_id = resp.id AND sent_at <= resp.created;
       UPDATE ezlogs.state
@@ -937,15 +1018,7 @@ BEGIN
      SET supabase_url = COALESCE(url, supabase_url), connected_at = now(), paused_until = NULL, failures = 0, last_error = NULL
    WHERE one;
 
-  -- Supabase's own tables.
-  IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'ezlogs_capture' AND tgrelid = 'auth.users'::regclass) THEN
-    CREATE TRIGGER ezlogs_capture AFTER INSERT OR UPDATE OR DELETE ON auth.users
-      FOR EACH ROW EXECUTE FUNCTION ezlogs.capture_auth_user();
-  END IF;
-  IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'ezlogs_capture' AND tgrelid = 'storage.objects'::regclass) THEN
-    CREATE TRIGGER ezlogs_capture AFTER INSERT OR UPDATE OR DELETE ON storage.objects
-      FOR EACH ROW EXECUTE FUNCTION ezlogs.capture_storage_object();
-  END IF;
+  PERFORM ezlogs.attach_platform();
 
   PERFORM ezlogs.reconcile();
   IF EXISTS (SELECT 1 FROM ezlogs.outbox) THEN
