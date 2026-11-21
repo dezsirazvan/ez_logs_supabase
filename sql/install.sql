@@ -593,14 +593,14 @@ BEGIN
 END;
 $$;
 
--- For people: stop recording a table, for good (until ezlogs.track). Survives renames.
--- Name a table's rows by one of its columns, for a table with no name, title, number or label
--- column (those already name rows): select ezlogs.name_records('public.invoices', 'number');
--- A NULL column goes back to the default. Refuses a table or column that doesn't exist, and a
--- column named like a secret (never sent, so it can't name anything). Safe in a migration:
+-- For people: name a table's rows by one of its columns, for a table with no name, title, number
+-- or label column (those already name rows): select ezlogs.name_records('public.<table>', '<column>');
+-- (for example ('public.invoices', 'reference')). A NULL column goes back to the default. Refuses a
+-- table or column that doesn't exist, and a column named like a secret (never sent, so it can't
+-- name anything). Safe in a migration, one IF block per table:
 --   DO $$ BEGIN IF to_regprocedure('ezlogs.name_records(text,text)') IS NOT NULL
---     AND to_regclass('public.invoices') IS NOT NULL THEN
---     PERFORM ezlogs.name_records('public.invoices', 'number'); END IF; END $$;
+--     AND to_regclass('public.<table>') IS NOT NULL THEN
+--     PERFORM ezlogs.name_records('public.<table>', '<column>'); END IF; END $$;
 CREATE OR REPLACE FUNCTION ezlogs.name_records(target text, column_name text) RETURNS text
   LANGUAGE plpgsql
   SECURITY DEFINER
@@ -666,6 +666,7 @@ AS $$
   UPDATE ezlogs.state SET record_names = ezlogs.record_names_json() WHERE one;
 $$;
 
+-- For people: stop recording a table, for good (until ezlogs.track). Survives renames.
 CREATE OR REPLACE FUNCTION ezlogs.untrack(target regclass) RETURNS void
   LANGUAGE plpgsql
   SECURITY DEFINER
