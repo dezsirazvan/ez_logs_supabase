@@ -303,6 +303,7 @@ sizes=[len(json.dumps(json.loads(l)['body'])) for l in open('$LOG') if l.strip()
 assert sizes and max(sizes) < 65536, max(sizes)"
 
 echo "== status and uninstall"
+check "connect says which version is running" bash -c "psql '$DB' -X -At -c \"select ezlogs.connect('$KEY')\" | grep -q '^Connected (EZLogs 1.2.0)\. Now recording changes to '"
 check "status reports the connection" python3 -I -c "import json,sys; s=json.loads(sys.argv[1]); assert s['connected'] and s['version']=='1.2.0' and s['waiting_rows']==0 and s['dropped_total']>=1, s" "$(q 'select ezlogs.status()')"
 check "the table created before connect is tracked since" test "$(q "select count(*) from pg_trigger where tgname='ezlogs_capture' and tgrelid='public.pre_connect'::regclass")" = 1
 check "uninstall" q "select ezlogs.uninstall()"

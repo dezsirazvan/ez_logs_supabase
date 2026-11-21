@@ -963,7 +963,8 @@ BEGIN
            timeout_milliseconds := 10000)
    WHERE one;
 
-  RETURN format('Connected. EZLogs now records changes to %s tables, sign-ups, sign-ins and files.',
+  RETURN format('Connected (EZLogs %s). Now recording changes to %s tables, sign-ups, sign-ins and files.',
+                ezlogs.version(),
                 (SELECT count(*) FROM pg_trigger WHERE tgname = 'ezlogs_capture' AND NOT tgisinternal
                    AND tgrelid IN (SELECT oid FROM pg_class WHERE relnamespace = 'public'::regnamespace)));
 END;
