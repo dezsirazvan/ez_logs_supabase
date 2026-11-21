@@ -16,7 +16,7 @@ One paste, no code in your app:
    code**. The code is this repository's [`sql/install.sql`](sql/install.sql) plus one
    `select ezlogs.connect('ezldb_…');` line carrying your database key.
 2. Paste it into your project's **SQL editor** and press **Run**:
-   - Lovable: Cloud → Database → SQL editor;
+   - Lovable: More → Database → Manage → SQL editor;
    - Bolt, v0 or your own project: the Supabase dashboard → SQL Editor.
 3. The EZLogs page switches to **Connected** within seconds.
 
