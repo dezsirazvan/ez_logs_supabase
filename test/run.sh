@@ -44,6 +44,9 @@ wait_until() { for _ in $(seq 1 "${2:-30}"); do eval "$1" && return 0; sleep 1; 
 received() { python3 -I -c "import json;print(sum(len(json.loads(l)['body']['rows']) for l in open('$LOG') if l.strip()))"; }
 outbox() { q "select count(*) from ezlogs.outbox"; }
 flush_job() { q "select count(*) from cron.job where jobname = 'ezlogs-flush'"; }
+# 1 when the table has EZLogs capture (statement triggers, or the row trigger), else 0.
+tracked() { q "select count(distinct tgrelid) from pg_trigger where tgname like 'ezlogs\\_capture%' and tgrelid = '$1'::regclass"; }
+all_tracked() { q "select count(distinct tgrelid) from pg_trigger where tgname like 'ezlogs\\_capture%' and not tgisinternal"; }
 
 echo "== same sensitive-column rules as ezlogs-nextjs"
 NEXT_SQL="$HERE/../../ez_logs_agent_nextjs/sql/postgres/00_install.sql"
@@ -59,7 +62,8 @@ assert a and a == b, (a, b)"
 echo "== setup: a small app (tables, RLS, a storage bucket)"
 q "select ezlogs.uninstall()" >/dev/null 2>&1
 psql "$DB" -X -q -v ON_ERROR_STOP=1 <<'SQL' || { echo "app setup failed"; exit 1; }
-DROP TABLE IF EXISTS public.items, public.feedback, public.later_table, public.pre_connect, public.api_tokens, public.wide, public.invoices, public.bills, public."order-items" CASCADE;
+DROP TABLE IF EXISTS public.items, public.feedback, public.later_table, public.pre_connect, public.api_tokens, public.wide, public.invoices, public.bills, public."order-items", public.docs15, public.bulk15, public.pairs15, public.vars15, public.keys15, public.orders15, public.purchases15, public.emb15, public.part15, public.pairs16, public.boxes, public.huge15, public.orphan15, public.schema_migrations_x, public.ar_internal_metadata, public.alias15, public.defer15, public.vc15, public.solo15, public.parent15, public.plain15, public.app_secrets15, public.stale15, public.big15, public.types15 CASCADE;
+CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA extensions;
 CREATE TABLE public.items (id bigserial PRIMARY KEY, name text UNIQUE NOT NULL, secret_token text,
                            settings jsonb, notes text, pairs jsonb[], created_by uuid DEFAULT auth.uid());
 ALTER TABLE public.items ENABLE ROW LEVEL SECURITY;
@@ -83,7 +87,7 @@ q "create table public.pre_connect (id bigserial primary key, label text); inser
 q "delete from auth.sessions where id = '00000000-0000-0000-0000-00000000005e'; delete from auth.users where id = '00000000-0000-0000-0000-0000000000ee';
    insert into auth.users (id, aud, role, email) values ('00000000-0000-0000-0000-0000000000ee', 'authenticated', 'authenticated', 'pre@example.com');
    insert into auth.sessions (id, user_id, created_at) values ('00000000-0000-0000-0000-00000000005e', '00000000-0000-0000-0000-0000000000ee', now())" >/dev/null
-check "nothing is recorded before connect" test "$(q "select (select count(*) from ezlogs.outbox) + (select count(*) from pg_trigger where tgname='ezlogs_capture')")" = 0
+check "nothing is recorded before connect" test "$(q "select (select count(*) from ezlogs.outbox) + (select count(*) from pg_trigger where tgname like 'ezlogs\_capture%')")" = 0
 q "CREATE OR REPLACE FUNCTION ezlogs.endpoint() RETURNS text LANGUAGE sql IMMUTABLE AS \$\$ SELECT '$ENDPOINT' \$\$" >/dev/null
 check "a bad key is refused with a clear message" bash -c "! psql '$DB' -X -At -c \"select ezlogs.connect('ezl_wrongkind', 'https://abc.supabase.co')\" 2>/dev/null"
 check "a full API key in the SQL editor is told where the database key is" bash -c "psql '$DB' -X -At -c \"select ezlogs.connect('ezl_wrongkind', 'https://abc.supabase.co')\" 2>&1 | grep -q 'Settings, API keys, the Lovable · Bolt · v0 tab'"
@@ -94,10 +98,13 @@ expect "connect says hello at once (an empty post), before the app writes anythi
 assert any(p['rows']==[] and p['install_id'] for p in posts), len(posts)"
 wait_until "[ \"\$(q \"select ezlogs.status()->>'hello'\")\" = 202 ]" 15
 check "status shows EZLogs' answer to the hello" test "$(q "select ezlogs.status()->>'hello'")" = 202
+wait_until "[ \"\$(tracked public.items)\" = 1 ] && [ \"\$(tracked public.pre_connect)\" = 1 ]" 30
+check "the app's tables are attached by the flush job, not inside connect" test "$(tracked public.items)" = 1
+check "statement capture: three triggers on a table with a one-column key" test "$(q "select string_agg(tgname, ',' order by tgname) from pg_trigger where tgrelid = 'public.items'::regclass and tgname like 'ezlogs%'")" = "ezlogs_capture_del,ezlogs_capture_ins,ezlogs_capture_upd"
 check "the key is in Vault, not in a table" test "$(q "select count(*) from vault.decrypted_secrets where name = 'ezlogs_ingest_key' and decrypted_secret = '$KEY'")" = 1
-check "public tables, auth.users and storage.objects are tracked" test "$(q "select count(*) from pg_trigger where tgname = 'ezlogs_capture' and not tgisinternal")" -ge 4
+check "public tables, auth.users and storage.objects are tracked" test "$(all_tracked)" -ge 4
 q "create table public.api_tokens (id bigserial primary key, value text)" >/dev/null
-check "a table named like a secret is not tracked" test "$(q "select count(*) from pg_trigger where tgname='ezlogs_capture' and tgrelid='public.api_tokens'::regclass")" = 0
+check "a table named like a secret is not tracked" test "$(tracked public.api_tokens)" = 0
 
 echo "== nothing is reachable through Supabase's HTTP API"
 check "the ezlogs schema is not served" bash -c "! curl -sf '$API_URL/rest/v1/outbox' -H 'apikey: $PUBLISHABLE_KEY' -H 'Accept-Profile: ezlogs' >/dev/null"
@@ -117,7 +124,8 @@ check "everything was delivered and the outbox is empty" test "$(outbox)" = 0
 expect "rows carry the user, verified by Supabase" "
 mine=[r for r in rows if r['schema']=='public' and r['table']=='items' and (r.get('claims') or {}).get('sub')=='$USER_ID']
 assert len(mine)>=3, len(mine)
-c=mine[0]['claims']; assert c['role']=='authenticated' and c['email'].startswith('ana.') and c['name']=='Ana Test' and c['iss'].endswith('/auth/v1'), c"
+c=mine[0]['claims']; assert c['role']=='authenticated' and c['email'].startswith('ana.') and c['name']=='Ana Test' and c['iss'].endswith('/auth/v1'), c
+assert len(c.get('session_id',''))==36, c  # the login's session: names browser reports (1.5.0)"
 expect "the click's requests share the browser's correlation id" "
 tagged={(r['table'],r['op']) for r in rows if r.get('correlation_id')=='$CID'}
 assert {('items','INSERT'),('items','UPDATE'),('items','DELETE'),('objects','INSERT')} <= tagged, tagged"
@@ -146,7 +154,7 @@ expect "an upload names the file and its owner" "
 o=[r for r in rows if r['schema']=='storage' and r['op']=='INSERT'][0]['new']
 assert o['bucket_id']=='files' and o['name'].startswith('$USER_ID/brief-') and o['owner_id']=='$USER_ID' and o['mimetype']=='text/plain', o"
 expect "every post names the install and the version" "
-assert all(p['version']=='1.4.0' and p['install_id'] and p['supabase_url']=='https://local-test.supabase.co' for p in posts)"
+assert all(p['version']=='1.5.1' and p['install_id'] and p['supabase_url']=='https://local-test.supabase.co' for p in posts)"
 check "the key travels only in the Authorization header" python3 -I -c "
 import json
 for l in open('$LOG'):
@@ -209,9 +217,9 @@ b=[r for r in rows if (r.get('new') or {}).get('name')=='as-b2'][0]['claims']['s
 assert a.endswith('a1') and b.endswith('b2'), (a, b)"
 
 echo "== re-attaching an unchanged table takes no lock"
-OID_BEFORE=$(q "select oid from pg_trigger where tgname='ezlogs_capture' and tgrelid='public.items'::regclass")
+OID_BEFORE=$(q "select oid from pg_trigger where tgname='ezlogs_capture_ins' and tgrelid='public.items'::regclass")
 q "select ezlogs.reconcile()" >/dev/null; q "select ezlogs.track('public.items')" >/dev/null
-check "the trigger is left as it is" test "$(q "select oid from pg_trigger where tgname='ezlogs_capture' and tgrelid='public.items'::regclass")" = "$OID_BEFORE"
+check "the trigger is left as it is" test "$(q "select oid from pg_trigger where tgname='ezlogs_capture_ins' and tgrelid='public.items'::regclass")" = "$OID_BEFORE"
 
 echo "== transactions"
 BEFORE=$(received)
@@ -222,6 +230,307 @@ expect "a rolled-back write is never sent" "assert not any((r.get('new') or {}).
 expect "one transaction's rows share its transaction id" "
 t=[r for r in rows if (r.get('new') or {}).get('name','').startswith('tx-')]
 assert len(t)==3 and len({r['txid'] for r in t})==1, t"
+
+echo "== 1.5.1: password changes and reset requests (never the hash or a token)"
+PW=00000000-0000-0000-0000-0000000000f1
+q "delete from auth.users where id = '$PW'; insert into auth.users (id, aud, role, email, encrypted_password) values ('$PW', 'authenticated', 'authenticated', 'pw@example.com', 'hash-one-SECRETHASH');" >/dev/null
+wait_until "[ \"\$(outbox)\" = 0 ]" 20
+BEFORE_PW=$(received)
+q "update auth.users set confirmation_token = 'tok-a', recovery_token = 'tok-b' where id = '$PW'" >/dev/null   # tokens only
+wait_until "[ \"\$(outbox)\" = 0 ]" 20
+q "update auth.users set encrypted_password = 'hash-two-SECRETHASH' where id = '$PW'" >/dev/null
+wait_until "[ \"\$(outbox)\" = 0 ]" 20
+q "update auth.users set recovery_sent_at = now(), recovery_token = 'tok-c' where id = '$PW'" >/dev/null
+wait_until "[ \"\$(outbox)\" = 0 ]" 20
+expect "an update touching only tokens enqueues nothing; a password change and a reset request one each" "
+u=[r for r in rows if r['schema']=='auth' and r['table']=='users' and r['op']=='UPDATE' and r['resource_id']=='$PW']
+assert len(u)==2, u
+p=[r for r in u if r['new'].get('pw_changed')]
+assert len(p)==1 and p[0]['new']['pw_changed'] is True, u
+s=[r for r in u if r['new'].get('recovery_sent_at')]
+assert len(s)==1 and not s[0]['new'].get('pw_changed'), u"
+expect "no hash, token or value derived from them is ever sent" "
+raw=json.dumps(rows)
+assert 'SECRETHASH' not in raw and 'tok-' not in raw and 'encrypted_password' not in raw and 'recovery_token' not in raw
+for r in rows:
+    if r['table']=='users' and r['resource_id']=='$PW':
+        assert set(r['new'] or {}) <= {'id','email','phone','name','created_at','invited_at','email_confirmed_at','phone_confirmed_at','last_sign_in_at','recovery_sent_at','banned_until','deleted_at','is_anonymous','pw_changed'}, r"
+q "delete from auth.users where id = '$PW'" >/dev/null
+
+echo "== 1.5.0: what an update carries, and what is never read"
+q "create table public.docs15 (id bigserial primary key, title text, status text, body text, blob bytea, seen_at timestamptz, settings jsonb);
+   grant all on public.docs15 to service_role;" >/dev/null
+wait_until "[ \"\$(tracked public.docs15)\" = 1 ]" 10
+q "insert into public.docs15 (title, status, body, blob) values ('Plan', 'draft', (select string_agg(md5(random()::text), '') from generate_series(1, 400)), decode(repeat('ab', 20000), 'hex'))" >/dev/null
+q "update public.docs15 set status = 'final' where title = 'Plan'" >/dev/null
+q "update public.docs15 set status = 'final' where title = 'Plan'" >/dev/null   # changes nothing
+wait_until "[ \"\$(outbox)\" = 0 ]" 20
+expect "an update carries only what changed, plus the key and the name column" "
+u=[r for r in rows if r['table']=='docs15' and r['op']=='UPDATE']
+assert len(u)==1, u
+assert set(u[0]['new'])=={'id','title','status'} and u[0]['old']['status']=='draft' and u[0]['new']['status']=='final', u[0]"
+expect "binary and large values are replaced by their size, never read into the row" "
+i=[r for r in rows if r['table']=='docs15' and r['op']=='INSERT'][0]['new']
+assert i['blob'].endswith('bytes, not recorded]') and i['body'].endswith('bytes, not recorded]') and i['title']=='Plan', i"
+
+echo "== 1.5.0: columns a person leaves out"
+check "ignore_columns says what it set" test "$(q "select ezlogs.ignore_columns('public.docs15', ARRAY['seen_at'])")" = "public.docs15: leaving out seen_at"
+check "ignore_columns refuses a column the table doesn't have" bash -c "psql '$DB' -X -At -c \"select ezlogs.ignore_columns('public.docs15', ARRAY['nope'])\" 2>&1 | grep -q 'has no column nope'"
+q "update public.docs15 set seen_at = now()" >/dev/null
+q "insert into public.docs15 (title, seen_at) values ('Second', now())" >/dev/null
+wait_until "[ \"\$(outbox)\" = 0 ]" 20
+expect "an update that changed only a left-out column is not recorded" "
+assert len([r for r in rows if r['table']=='docs15' and r['op']=='UPDATE'])==1"
+expect "a left-out column is never sent" "
+s=[r for r in rows if r['table']=='docs15' and (r.get('new') or {}).get('title')=='Second'][0]['new']
+assert 'seen_at' not in s and s['title']=='Second', s"
+
+echo "== 1.5.0: a statement over 100 rows is one bulk row"
+q "create table public.bulk15 (id bigserial primary key, status text, n int, api_key text, meta jsonb); grant all on public.bulk15 to service_role;" >/dev/null
+wait_until "[ \"\$(tracked public.bulk15)\" = 1 ]" 10
+q "insert into public.bulk15 (status, n, api_key, meta) select 'todo', g, 'k' || g, '{\"api_token\":\"t\"}' from generate_series(1, 500) g" >/dev/null
+q "update public.bulk15 set status = 'done', n = n + 1, meta = '{\"api_token\":\"t2\"}'" >/dev/null
+q "update public.bulk15 set api_key = 'rotated'" >/dev/null   # only a secret column: nothing to record
+q "delete from public.bulk15" >/dev/null
+wait_until "[ \"\$(outbox)\" = 0 ]" 20
+expect "500 inserted rows are one row: how many, and a few ids" "
+b=[r for r in rows if r['table']=='bulk15' and r['op']=='INSERT']
+assert len(b)==1 and b[0]['row_count']==500 and len(b[0]['bulk']['sample_ids'])==5 and not b[0].get('new'), b"
+expect "a bulk update says which columns changed, with the value every row got" "
+b=[r for r in rows if r['table']=='bulk15' and r['op']=='UPDATE']
+assert len(b)==1 and b[0]['row_count']==500, b
+c=b[0]['bulk']['columns']
+assert c=={'status':'done','n':{'changed':True},'meta':{'changed':True}}, c"
+expect "a bulk delete is one row too" "
+b=[r for r in rows if r['table']=='bulk15' and r['op']=='DELETE']
+assert len(b)==1 and b[0]['row_count']==500, b"
+expect "a bulk row never carries a secret column or a json value" "
+b=json.dumps([r for r in rows if r['table']=='bulk15'])
+assert 'api_key' not in b and 'rotated' not in b and 'api_token' not in b, b[:300]"
+check "no transaction marks are left behind" test "$(q 'select count(*) from ezlogs.tx_marks')" = 0
+
+echo "== 1.5.0: a table without a one-column key keeps one trigger per row"
+q "create table public.pairs15 (a int, b int, note text, primary key (a, b)); grant all on public.pairs15 to service_role;" >/dev/null
+wait_until "[ \"\$(tracked public.pairs15)\" = 1 ]" 10
+check "it gets the row trigger" test "$(q "select tgname from pg_trigger where tgrelid='public.pairs15'::regclass and tgname like 'ezlogs%'")" = ezlogs_capture
+q "insert into public.pairs15 values (1, 2, 'x'); update public.pairs15 set note = 'y'" >/dev/null
+wait_until "[ \"\$(outbox)\" = 0 ]" 20
+expect "and its changes arrive" "
+p=[r for r in rows if r['table']=='pairs15']
+assert [r['op'] for r in p]==['INSERT','UPDATE'] and p[1]['new']['note']=='y', p"
+
+echo "== 1.5.0: a schema change on a host without event triggers"
+q "alter event trigger ezlogs_track_tables disable" >/dev/null
+q "alter table public.docs15 drop column status" >/dev/null
+q "insert into public.docs15 (title) values ('stale-list')" >/dev/null   # captured by the old triggers: fails safely
+check "the app's write succeeded" test "$(q "select count(*) from public.docs15 where title = 'stale-list'")" = 1
+q "select ezlogs.queue_reconcile()" >/dev/null
+wait_until "[ \"\$(q \"select ezlogs.attach_needed('public.docs15')\")\" = f ]" 20
+q "alter event trigger ezlogs_track_tables enable" >/dev/null
+q "insert into public.docs15 (title) values ('after-reattach')" >/dev/null
+wait_until "[ \"\$(outbox)\" = 0 ]" 20
+expect "reconcile sees the change and capture works again" "assert any((r.get('new') or {}).get('title')=='after-reattach' for r in rows)"
+
+echo "== 1.5.0: columns named like the capture's own variables"
+q "create table public.vars15 (id bigserial primary key, summary text, claims text, cid int, cnt int, found boolean, new text, old text, tg_op text);
+   grant all on public.vars15 to service_role;" >/dev/null
+wait_until "[ \"\$(tracked public.vars15)\" = 1 ]" 10
+q "insert into public.vars15 (summary, claims, cid, cnt, found, new, old, tg_op) values ('s1', 'c1', 1, 1, true, 'n', 'o', 't')" >/dev/null
+q "update public.vars15 set summary = 's2'" >/dev/null
+q "insert into public.vars15 (summary) select 'bulk' from generate_series(1, 150); update public.vars15 set claims = 'all'" >/dev/null
+wait_until "[ \"\$(outbox)\" = 0 ]" 20
+expect "a table with columns named summary, claims, new, found... is captured" "
+v=[r for r in rows if r['table']=='vars15']
+ops=[(r['op'], r.get('row_count')) for r in v]
+assert ('INSERT', None) in ops and ('UPDATE', None) in ops and ('INSERT', 150) in ops and ('UPDATE', 151) in ops, ops
+u=[r for r in v if r['op']=='UPDATE' and not r.get('row_count')][0]
+assert u['new']['summary']=='s2' and u['old']['summary']=='s1', u
+b=[r for r in v if r['op']=='UPDATE' and r.get('row_count')][0]
+assert b['bulk']['columns']=={'claims':'all'}, b['bulk']"
+
+echo "== 1.5.0: an update that changes keys is a count, never a wrong pairing"
+q "create table public.keys15 (id int primary key, v text); grant all on public.keys15 to service_role; insert into public.keys15 values (1, 'one'), (2, 'two')" >/dev/null
+wait_until "[ \"\$(tracked public.keys15)\" = 1 ]" 10
+q "update public.keys15 set id = id + 10" >/dev/null
+wait_until "[ \"\$(outbox)\" = 0 ]" 20
+expect "two rows whose keys moved are recorded as 2 rows updated, no values" "
+k=[r for r in rows if r['table']=='keys15' and r['op']=='UPDATE']
+assert len(k)==1 and k[0]['row_count']==2 and not k[0].get('new') and not k[0].get('old'), k"
+
+echo "== 1.5.0: a renamed table is recorded under its new name"
+q "create table public.orders15 (id bigserial primary key, label text); grant all on public.orders15 to service_role;" >/dev/null
+wait_until "[ \"\$(tracked public.orders15)\" = 1 ]" 10
+q "alter event trigger ezlogs_track_tables disable; alter table public.orders15 rename to purchases15; alter event trigger ezlogs_track_tables enable" >/dev/null
+q "select ezlogs.queue_reconcile()" >/dev/null
+wait_until "[ \"\$(q \"select ezlogs.attach_needed('public.purchases15')\")\" = f ]" 20
+q "insert into public.purchases15 (label) values ('renamed')" >/dev/null
+wait_until "[ \"\$(outbox)\" = 0 ]" 20
+expect "rows arrive as purchases15" "
+p=[r for r in rows if (r.get('new') or {}).get('label')=='renamed']
+assert p and p[0]['table']=='purchases15', p"
+
+echo "== 1.5.0: vectors, partitions, left-out columns on any table, name columns"
+q "create table public.emb15 (id bigserial primary key, title text, embedding extensions.vector(3)); grant all on public.emb15 to service_role;" >/dev/null
+wait_until "[ \"\$(tracked public.emb15)\" = 1 ]" 10
+q "insert into public.emb15 (title, embedding) select 'e' || g, '[1,2,3]' from generate_series(1, 150) g; update public.emb15 set embedding = '[3,2,1]'" >/dev/null
+q "create table public.part15 (id bigint primary key, note text) partition by range (id); create table public.part15_a partition of public.part15 for values from (0) to (1000);
+   grant all on public.part15, public.part15_a to service_role;" >/dev/null
+wait_until "[ \"\$(tracked public.part15)\" = 1 ]" 10
+q "insert into public.part15_a values (5, 'direct'); insert into public.part15 values (6, 'parent')" >/dev/null
+q "create table public.pairs16 (a int, b int, note text, seen_at timestamptz, primary key (a, b)); grant all on public.pairs16 to service_role;" >/dev/null
+wait_until "[ \"\$(tracked public.pairs16)\" = 1 ]" 10
+check "ignore_columns refuses a key column" bash -c "psql '$DB' -X -At -c \"select ezlogs.ignore_columns('public.pairs16', ARRAY['a'])\" 2>&1 | grep -q 'part of the primary key'"
+q "select ezlogs.ignore_columns('public.pairs16', ARRAY['seen_at'])" >/dev/null
+q "insert into public.pairs16 values (1, 1, 'x', now()); update public.pairs16 set seen_at = now()" >/dev/null
+q "create table public.boxes (id bigserial primary key, \"Name\" text, box_number text, qty int); grant all on public.boxes to service_role;" >/dev/null
+wait_until "[ \"\$(tracked public.boxes)\" = 1 ]" 10
+q "insert into public.boxes (\"Name\", box_number, qty) values ('Big', 'B-7', 1); update public.boxes set qty = 2" >/dev/null
+wait_until "[ \"\$(outbox)\" = 0 ]" 20
+expect "a bulk update of a vector column is recorded" "
+e=[r for r in rows if r['table']=='emb15' and r['op']=='UPDATE']
+assert len(e)==1 and e[0]['bulk']['columns']=={'embedding':{'changed':True}}, e"
+expect "a write made straight to a partition is recorded, under the parent's name" "
+p=sorted((r['new'] or {}).get('note') for r in rows if r['table']=='part15')
+assert p==['direct','parent'], p"
+expect "a left-out column is never sent by a table without a one-column key, and its own update is dropped" "
+p=[r for r in rows if r['table']=='pairs16']
+assert [r['op'] for r in p]==['INSERT'] and 'seen_at' not in p[0]['new'], p"
+expect "an update keeps the name columns the server reads (any case, <record>_number)" "
+u=[r for r in rows if r['table']=='boxes' and r['op']=='UPDATE'][0]['new']
+assert u.get('Name')=='Big' and u.get('box_number')=='B-7' and u['qty']==2, u"
+
+echo "== 1.5.0: a very large update is a count, quickly"
+q "create table public.huge15 (id bigserial primary key, a text, b text, c int); grant all on public.huge15 to service_role;" >/dev/null
+wait_until "[ \"\$(tracked public.huge15)\" = 1 ]" 10
+q "insert into public.huge15 (a, b, c) select 'a', 'b', g from generate_series(1, 20000) g" >/dev/null
+q "update public.huge15 set c = c + 1" >/dev/null
+wait_until "[ \"\$(outbox)\" = 0 ]" 20
+expect "20,000 rows updated: the count and a few ids, no per-column summary" "
+h=[r for r in rows if r['table']=='huge15' and r['op']=='UPDATE']
+assert len(h)==1 and h[0]['row_count']==20000 and 'columns' not in h[0]['bulk'] and len(h[0]['bulk']['sample_ids'])==5, h"
+
+echo "== 1.5.0: capture functions left by a restore never stop the job"
+q "create function ezlogs.cap_1_ins_deadbeef() returns trigger language plpgsql as \$\$ begin return null; end \$\$;
+   create table public.orphan15 (id bigserial primary key); grant all on public.orphan15 to service_role;
+   create function ezlogs.cap_2_ins_deadbeef() returns trigger language plpgsql as \$\$ begin return null; end \$\$;
+   create trigger rv_other after insert on public.orphan15 for each statement execute function ezlogs.cap_2_ins_deadbeef();" >/dev/null
+check "cleanup runs without an error" q "select ezlogs.drop_orphan_captures()"
+check "an unused one is removed, one a trigger still uses is kept" test "$(q "select string_agg(proname, ',' order by proname) from pg_proc where proname like 'cap\\_%deadbeef'")" = "cap_2_ins_deadbeef"
+q "drop table public.orphan15; select ezlogs.drop_orphan_captures()" >/dev/null
+
+echo "== 1.5.0: a table a person tracked is refreshed after a schema change"
+q "create table public.schema_migrations_x (id bigserial primary key, v text, w text)" >/dev/null
+q "create table public.ar_internal_metadata (id bigserial primary key, v text, w text); grant all on public.ar_internal_metadata to service_role;" >/dev/null
+q "select ezlogs.track('public.ar_internal_metadata')" >/dev/null
+q "alter table public.ar_internal_metadata drop column w" >/dev/null
+q "insert into public.ar_internal_metadata (v) values ('tracked-by-person')" >/dev/null
+wait_until "[ \"\$(outbox)\" = 0 ]" 20
+expect "its rows still arrive" "assert any((r.get('new') or {}).get('v')=='tracked-by-person' for r in rows)"
+
+echo "== 1.5.0: second review"
+q "create table public.alias15 (id bigserial primary key, s text, od text, nw text); grant all on public.alias15 to service_role;" >/dev/null
+wait_until "[ \"\$(tracked public.alias15)\" = 1 ]" 10
+q "insert into public.alias15 (s, od, nw) values ('sv', 'ov', 'nv'); update public.alias15 set s = 's2'" >/dev/null
+q "create table public.defer15 (id int primary key deferrable initially immediate, v text); grant all on public.defer15 to service_role; insert into public.defer15 values (1, 'one'), (2, 'two')" >/dev/null
+wait_until "[ \"\$(tracked public.defer15)\" = 1 ]" 10
+check "a table with a deferrable key gets the row trigger" test "$(q "select tgname from pg_trigger where tgrelid='public.defer15'::regclass and tgname like 'ezlogs%'")" = ezlogs_capture
+q "create table public.vc15 (code varchar(20) primary key, label text); grant all on public.vc15 to service_role;" >/dev/null
+wait_until "[ \"\$(tracked public.vc15)\" = 1 ]" 10
+check "a varchar key keeps statement capture" test "$(q "select count(*) from pg_trigger where tgrelid='public.vc15'::regclass and tgname like 'ezlogs\\_capture\\_%'")" = 3
+q "insert into public.vc15 values ('A-1', 'first'); update public.vc15 set label = 'second'" >/dev/null
+check "ignore_columns refuses a missing (NULL) name" bash -c "psql '$DB' -X -At -c \"select ezlogs.ignore_columns('public.vc15', ARRAY['label', NULL])\" 2>&1 | grep -q 'is missing (NULL)'"
+q "create table public.solo15 (id bigint primary key, note text); grant all on public.solo15 to service_role;" >/dev/null
+wait_until "[ \"\$(tracked public.solo15)\" = 1 ]" 10
+q "create table public.parent15 (id bigint primary key, note text) partition by range (id); grant all on public.parent15 to service_role;" >/dev/null
+wait_until "[ \"\$(tracked public.parent15)\" = 1 ]" 10
+check "attaching a table with its own capture as a partition works (the customer's migration)" q "alter table public.parent15 attach partition public.solo15 for values from (0) to (100)"
+q "insert into public.solo15 values (7, 'once')" >/dev/null
+q "create table public.plain15 (id bigserial primary key, v text); grant all on public.plain15 to service_role;" >/dev/null
+wait_until "[ \"\$(tracked public.plain15)\" = 1 ]" 10
+q "alter table public.plain15 rename to app_secrets15" >/dev/null
+check "a table renamed to a secret-like name stops being recorded" test "$(tracked public.app_secrets15)" = 0
+wait_until "[ \"\$(outbox)\" = 0 ]" 20
+expect "columns named s, od, nw are recorded as columns" "
+a=[r for r in rows if r['table']=='alias15']
+assert [x['op'] for x in a]==['INSERT','UPDATE'] and a[0]['new']['s']=='sv' and a[0]['new']['od']=='ov' and a[1]['new']['s']=='s2', a"
+expect "a varchar key's changes arrive" "
+v=[r for r in rows if r['table']=='vc15']
+assert [x['op'] for x in v]==['INSERT','UPDATE'] and v[1]['new']['label']=='second' and v[1]['resource_id']=='A-1', v"
+expect "a row written to a table that became a partition is recorded once, under its parent" "
+p=[r for r in rows if (r.get('new') or {}).get('note')=='once']
+assert len(p)==1 and p[0]['table']=='parent15', p"
+
+echo "== 1.5.0: a capture that fails asks for the table to be attached again"
+q "alter event trigger ezlogs_track_tables disable" >/dev/null
+q "create table public.stale15 (id bigserial primary key, note text); grant all on public.stale15 to service_role;" >/dev/null
+q "select ezlogs.attach('public.stale15'::regclass)" >/dev/null
+q "update ezlogs.state set last_reconciled = now()" >/dev/null
+q "alter table public.stale15 rename column note to remark" >/dev/null
+q "insert into public.stale15 (remark) values ('lost one')" >/dev/null 2>&1
+check "the failure asks the job to look again" test -z "$(q 'select last_reconciled from ezlogs.state')"
+q "select ezlogs.ensure_flush_job()" >/dev/null
+wait_until "[ \"\$(q \"select ezlogs.attach_needed('public.stale15')\")\" = f ]" 20
+q "alter event trigger ezlogs_track_tables enable" >/dev/null
+q "insert into public.stale15 (remark) values ('back again')" >/dev/null
+wait_until "[ \"\$(outbox)\" = 0 ]" 20
+expect "and capture works again within seconds" "assert any((r.get('new') or {}).get('remark')=='back again' for r in rows)"
+
+echo "== 1.5.0: a bulk update over large rows stays fast"
+q "create table public.big15 (id bigserial primary key, status text, body text, doc jsonb); grant all on public.big15 to service_role;" >/dev/null
+wait_until "[ \"\$(tracked public.big15)\" = 1 ]" 10
+q "insert into public.big15 (status, body, doc)
+   select 'a', (select string_agg(md5(random()::text || x.i || g.i), '') from generate_series(1, 1000) x(i)),
+          jsonb_build_object('k', (select string_agg(md5(random()::text || y.i || g.i), '') from generate_series(1, 900) y(i)))
+     from generate_series(1, 1000) g(i)" >/dev/null
+q "alter table public.big15 disable trigger ezlogs_capture_upd" >/dev/null
+T0=$(python3 -c 'import time;print(time.time())'); q "update public.big15 set status = 'b'" >/dev/null; T1=$(python3 -c 'import time;print(time.time())')
+q "alter table public.big15 enable trigger ezlogs_capture_upd" >/dev/null
+wait_until "[ \"\$(outbox)\" = 0 ]" 60
+T2=$(python3 -c 'import time;print(time.time())'); q "update public.big15 set status = 'c'" >/dev/null; T3=$(python3 -c 'import time;print(time.time())')
+check "1,000 rows of 60 KB: capture adds less than the update itself" python3 -c "base=$T1-$T0; withc=$T3-$T2; assert withc < 2*base + 0.3, (base, withc)"
+wait_until "[ \"\$(outbox)\" = 0 ]" 60
+expect "and says what it set" "
+b=[r for r in rows if r['table']=='big15' and r['op']=='UPDATE'][-1]
+assert b['bulk']['columns']=={'status':'c'}, b['bulk']"
+
+echo "== 1.5.0: third review"
+q "create table public.types15 (id bigserial primary key, doc xml, b box, d interval, big text); grant all on public.types15 to service_role;" >/dev/null
+wait_until "[ \"\$(tracked public.types15)\" = 1 ]" 10
+q "insert into public.types15 (doc, b, d, big) select '<a/>', '((0,0),(1,1))', '1 day', (select string_agg(md5(random()::text || x.i || g.i), '') from generate_series(1, 400) x(i)) from generate_series(1, 150) g(i)" >/dev/null
+q "update public.types15 set doc = '<b/>'" >/dev/null
+q "update public.types15 set b = '((5,5),(6,6))'" >/dev/null
+q "update public.types15 set d = '24 hours'" >/dev/null
+q "update public.types15 set big = big || ''" >/dev/null
+q "update public.types15 set big = big where id <= 3" >/dev/null
+wait_until "[ \"\$(outbox)\" = 0 ]" 30
+expect "bulk updates of xml, box and interval columns are each recorded with what they set" "
+u=[r['bulk']['columns'] for r in rows if r['table']=='types15' and r['op']=='UPDATE']
+assert u==[{'doc':'<b/>'}, {'b':'(6,6),(5,5)'}, {'d':'24:00:00'}], u"
+expect "a large value sent again unchanged is not a change, in bulk or row by row" "
+assert len([r for r in rows if r['table']=='types15' and r['op']=='UPDATE'])==3"
+
+echo "== 1.5.0: the outbox can never fill the database"
+echo 503 > "$STATUS"
+q "update ezlogs.state set outbox_cap_bytes = 20000" >/dev/null
+for i in $(seq 1 30); do echo "insert into public.items(name) values ('fill-$i-' || repeat('f', 900));"; done | psql "$DB" -X -q
+q "update ezlogs.state set paused_until = null" >/dev/null
+wait_until "[ -n \"\$(q 'select capture_paused_at from ezlogs.state')\" ]" 20
+check "capture pauses past the cap, with the reason" test "$(q "select capture_paused_reason from ezlogs.state")" = "the outbox reached its size limit (EZLogs could not keep up)"
+BEFORE_PAUSED=$(q "select count(*) from ezlogs.outbox")
+check "the app writes while paused" q "insert into public.items(name) values ('while-paused')"
+check "and nothing is queued for it" test "$(q "select count(*) from ezlogs.outbox")" = "$BEFORE_PAUSED"
+check "status reports the pause" python3 -I -c "import json,sys; s=json.loads(sys.argv[1]); assert s['capture_paused'] and s['capture_paused']['reason'].startswith('the outbox'), s" "$(q 'select ezlogs.status()')"
+echo 202 > "$STATUS"
+q "update ezlogs.state set paused_until = null, failures = 0" >/dev/null
+wait_until "[ -z \"\$(q 'select capture_paused_at from ezlogs.state')\" ]" 30
+check "it resumes once the outbox is under half the cap" test -z "$(q 'select capture_paused_at from ezlogs.state')"
+wait_until "[ \"\$(outbox)\" = 0 ]" 30
+q "update ezlogs.state set outbox_cap_bytes = 52428800" >/dev/null
+expect "posts sent while paused said so" "assert any((p.get('capture_paused') or {}).get('reason','').startswith('the outbox') for p in posts)"
+expect "the write made while paused was not recorded" "assert not any((r.get('new') or {}).get('name')=='while-paused' for r in rows)"
+q "insert into public.items(name) values ('after-resume')" >/dev/null
+wait_until "[ \"\$(outbox)\" = 0 ]" 20
+expect "writes are recorded again after it resumes" "assert any((r.get('new') or {}).get('name')=='after-resume' for r in rows)"
 
 echo "== new tables are tracked as soon as they are created"
 q "create table public.later_table (id bigserial primary key, label text); grant all on public.later_table to service_role;" >/dev/null
@@ -234,9 +543,9 @@ q "select ezlogs.untrack('public.later_table')" >/dev/null
 q "update ezlogs.state set last_reconciled = null" >/dev/null       # force the next reconcile
 q "insert into public.items(name) values ('reconcile-now')" >/dev/null
 wait_until "[ \"\$(outbox)\" = 0 ]" 20
-check "reconcile does not re-attach an untracked table" test "$(q "select count(*) from pg_trigger where tgname='ezlogs_capture' and tgrelid='public.later_table'::regclass")" = 0
+check "reconcile does not re-attach an untracked table" test "$(tracked public.later_table)" = 0
 q "select ezlogs.track('public.later_table')" >/dev/null
-check "track brings it back" test "$(q "select count(*) from pg_trigger where tgname='ezlogs_capture' and tgrelid='public.later_table'::regclass")" = 1
+check "track brings it back" test "$(tracked public.later_table)" = 1
 
 echo "== naming records by a column"
 q "create table public.invoices (id bigserial primary key, reference text, amount_cents int, api_token text); grant all on public.invoices to service_role; grant usage on sequence public.invoices_id_seq to service_role;" >/dev/null
@@ -361,11 +670,11 @@ wait_until "[ \"\$(outbox)\" = 0 ]" 30
 check "an upgrade sends the sessions still valid again (EZLogs keeps one per id)" test "$(outbox)" = 0
 
 echo "== status and uninstall"
-check "connect says which version is running" bash -c "psql '$DB' -X -At -c \"select ezlogs.connect('$KEY')\" | grep -q '^Connected (EZLogs 1.4.0)\. Now recording changes to '"
-check "status reports the connection" python3 -I -c "import json,sys; s=json.loads(sys.argv[1]); assert s['connected'] and s['version']=='1.4.0' and s['waiting_rows']==0 and s['dropped_total']>=1, s" "$(q 'select ezlogs.status()')"
-check "the table created before connect is tracked since" test "$(q "select count(*) from pg_trigger where tgname='ezlogs_capture' and tgrelid='public.pre_connect'::regclass")" = 1
+check "connect says which version is running" bash -c "psql '$DB' -X -At -c \"select ezlogs.connect('$KEY')\" | grep -q '^Connected (EZLogs 1.5.1)\. Now recording changes to '"
+check "status reports the connection" python3 -I -c "import json,sys; s=json.loads(sys.argv[1]); assert s['connected'] and s['version']=='1.5.1' and s['waiting_rows']==0 and s['dropped_total']>=1, s" "$(q 'select ezlogs.status()')"
+check "the table created before connect is tracked since" test "$(tracked public.pre_connect)" = 1
 check "uninstall" q "select ezlogs.uninstall()"
-check "no triggers, no schema, no key, no job are left" test "$(q "select (select count(*) from pg_trigger where tgname='ezlogs_capture') + (select count(*) from pg_namespace where nspname='ezlogs') + (select count(*) from vault.secrets where name='ezlogs_ingest_key') + (select count(*) from cron.job where jobname='ezlogs-flush') + (select count(*) from pg_event_trigger where evtname='ezlogs_track_tables')")" = 0
+check "no triggers, no schema, no key, no job are left" test "$(q "select (select count(*) from pg_trigger where tgname like 'ezlogs\_capture%') + (select count(*) from pg_namespace where nspname='ezlogs') + (select count(*) from vault.secrets where name='ezlogs_ingest_key') + (select count(*) from cron.job where jobname='ezlogs-flush') + (select count(*) from pg_event_trigger where evtname='ezlogs_track_tables')")" = 0
 check "the app still writes after uninstall" q "insert into public.items(name) values ('after-uninstall')"
 
 echo

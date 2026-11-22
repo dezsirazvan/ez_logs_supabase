@@ -9,11 +9,12 @@
 -- Nothing is recorded until connect() runs.
 --
 -- What it does:
---   * an AFTER trigger on every table in `public` (new tables are picked up), on auth.users
---     (sign-ups, sign-ins, account changes), on auth.sessions (a new session's id and user only)
---     and on storage.objects (files), writing one row
---     per change into ezlogs.outbox, with sensitive columns removed (inside json too) and very
---     large values cut;
+--   * on every table in `public` (new tables are picked up): capture once per statement (three
+--     statement triggers and functions made for that table; a table without a one-column key has
+--     one row trigger), on auth.users (sign-ups, sign-ins, account changes), on auth.sessions (a
+--     new session's id and user only) and on storage.objects (files), writing into ezlogs.outbox
+--     with sensitive and ignored columns removed (inside json too) and large values replaced by
+--     their size; an update carries what changed; a statement over 100 rows is one bulk row;
 --   * who did it comes from the login Supabase already verified (request.jwt.claims);
 --   * when a writing transaction commits, at most once a second, the database posts what is
 --     waiting to EZLogs with pg_net; rows leave the outbox only after EZLogs confirmed them;
@@ -21,19 +22,19 @@
 --     removes itself, so an idle project runs nothing of ours and still pauses normally.
 --
 -- Guarantees:
---   * it never blocks or breaks a write: per-row work is a small insert that swallows its own
---     errors; the work at commit is bounded, index-only, takes no lock anyone waits for and
---     swallows its own errors; everything else (confirmations, cleanup, new tables) runs in
---     the flush job;
+--   * it never blocks or breaks a write: per-statement work is one bounded insert that swallows
+--     its own errors; the work at commit is bounded, index-only, takes no lock anyone waits for
+--     and swallows its own errors; everything else (confirmations, cleanup, attaching tables)
+--     runs in the flush job, with short lock timeouts;
+--   * it never fills the database: past 50 MB waiting (or 5% of the database) capture pauses
+--     until the outbox drains to half;
 --   * nothing here is reachable through Supabase's HTTP API (own schema, no grants);
 --   * data only ever goes to app.ezlogs.io (hard-coded, not a setting);
 --   * the key lives in Supabase Vault (readable there by the database owner and service_role,
 --     as every Vault secret is; it is an ingest-only key that can never read data back).
 --
--- Limits: a few hundred changed rows a second sustained (posts stay under 48 KB: pg_net stalls
--- on bigger bodies); past 500,000 waiting rows or 7 days
--- the oldest are dropped (and counted). A transaction writing many rows creates one
--- subtransaction per row (the price of never failing the app's write).
+-- Limits: about 45,000 changed rows a minute shipped (posts stay under 48 KB: pg_net stalls on
+-- bigger bodies); past 500,000 waiting rows or 7 days the oldest are dropped (and counted).
 --
 -- Remove everything with: select ezlogs.uninstall();
 
@@ -91,6 +92,43 @@ BEGIN
   END LOOP;
 END $$;
 
+-- Re-applying this file (an upgrade) must never take a lock on a table every captured write
+-- uses unless something is really missing: ALTER TABLE ... ADD COLUMN IF NOT EXISTS and CREATE
+-- INDEX IF NOT EXISTS lock the table even when there is nothing to do. These check the catalog
+-- first, and wait at most half a second for the lock when a change is needed (the install then
+-- stops with a message; run it again), so the app's writes never queue behind it for long.
+CREATE OR REPLACE FUNCTION ezlogs.ensure_column(tbl text, col text, def text) RETURNS void
+  LANGUAGE plpgsql
+AS $$
+DECLARE
+  prev text := current_setting('lock_timeout');
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = tbl::regclass AND attname = col AND attnum > 0 AND NOT attisdropped) THEN
+    PERFORM set_config('lock_timeout', '500ms', true);
+    EXECUTE format('ALTER TABLE %s ADD COLUMN IF NOT EXISTS %I %s', tbl, col, def);
+    PERFORM set_config('lock_timeout', prev, true);
+  END IF;
+EXCEPTION WHEN lock_not_available THEN
+  RAISE EXCEPTION '[ezlogs] % is busy right now, so this upgrade stopped without changing anything. Run it again in a moment.', tbl;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION ezlogs.ensure_index(name text, ddl text) RETURNS void
+  LANGUAGE plpgsql
+AS $$
+DECLARE
+  prev text := current_setting('lock_timeout');
+BEGIN
+  IF to_regclass('ezlogs.' || quote_ident(name)) IS NULL THEN
+    PERFORM set_config('lock_timeout', '500ms', true);
+    EXECUTE ddl;
+    PERFORM set_config('lock_timeout', prev, true);
+  END IF;
+EXCEPTION WHEN lock_not_available THEN
+  RAISE EXCEPTION '[ezlogs] the outbox is busy right now, so this upgrade stopped without changing anything. Run it again in a moment.';
+END;
+$$;
+
 -- ---------------------------------------------------------------------------------------
 -- Tables
 -- ---------------------------------------------------------------------------------------
@@ -115,8 +153,11 @@ CREATE TABLE IF NOT EXISTS ezlogs.outbox (
   request_id     bigint,
   sent_at        timestamptz
 );
-CREATE INDEX IF NOT EXISTS outbox_unsent_idx ON ezlogs.outbox (id) WHERE request_id IS NULL;
-CREATE INDEX IF NOT EXISTS outbox_request_idx ON ezlogs.outbox (request_id) WHERE request_id IS NOT NULL;
+-- A statement over ezlogs.bulk_threshold() rows is one row here (1.5.0): how many, and what it set.
+SELECT ezlogs.ensure_column('ezlogs.outbox', 'row_count', 'int');
+SELECT ezlogs.ensure_column('ezlogs.outbox', 'bulk', 'jsonb');
+SELECT ezlogs.ensure_index('outbox_unsent_idx', 'CREATE INDEX IF NOT EXISTS outbox_unsent_idx ON ezlogs.outbox (id) WHERE request_id IS NULL');
+SELECT ezlogs.ensure_index('outbox_request_idx', 'CREATE INDEX IF NOT EXISTS outbox_request_idx ON ezlogs.outbox (request_id) WHERE request_id IS NOT NULL');
 
 -- One row. Shipping state and what status() shows.
 CREATE TABLE IF NOT EXISTS ezlogs.state (
@@ -135,25 +176,47 @@ CREATE TABLE IF NOT EXISTS ezlogs.state (
   -- The empty post connect() sends, so EZLogs shows "Connected" at once; status() reads its reply.
   hello_request_id bigint
 );
-ALTER TABLE ezlogs.state ADD COLUMN IF NOT EXISTS hello_request_id bigint;
+SELECT ezlogs.ensure_column('ezlogs.state', 'hello_request_id', 'bigint');
 -- {"public.invoices": "reference"}: ezlogs.record_names as each post sends it, kept here so sending
 -- (which also runs at commit) reads no other table. Refreshed by name_records and schema changes.
-ALTER TABLE ezlogs.state ADD COLUMN IF NOT EXISTS record_names jsonb NOT NULL DEFAULT '{}'::jsonb;
+SELECT ezlogs.ensure_column('ezlogs.state', 'record_names', 'jsonb NOT NULL DEFAULT ''{}''::jsonb');
+-- Capture paused so the outbox can never fill the database (1.5.0): since when and why
+-- ('outbox full', or 'EZLogs refused for an hour: <reason>'). The flush job resumes it.
+SELECT ezlogs.ensure_column('ezlogs.state', 'capture_paused_at', 'timestamptz');
+SELECT ezlogs.ensure_column('ezlogs.state', 'capture_paused_reason', 'text');
+-- Since when EZLogs has refused for something only a person can fix (401, 402, 403, 423).
+SELECT ezlogs.ensure_column('ezlogs.state', 'blocked_since', 'timestamptz');
+-- The outbox's size cap in bytes, measured at reconcile: 50 MB or 5% of the database, the smaller.
+SELECT ezlogs.ensure_column('ezlogs.state', 'outbox_cap_bytes', 'bigint');
 INSERT INTO ezlogs.state (one) VALUES (true) ON CONFLICT DO NOTHING;
 
 -- Tables a person took out with ezlogs.untrack(); nothing puts them back but ezlogs.track().
 CREATE TABLE IF NOT EXISTS ezlogs.excluded (table_oid oid PRIMARY KEY);
+
+-- Tables a person recorded with ezlogs.track() though their name is one EZLogs skips.
+CREATE TABLE IF NOT EXISTS ezlogs.tracked (table_oid oid PRIMARY KEY);
 
 -- The column a person recognises a table's rows by, set with ezlogs.name_records() when the
 -- table has no name, title, number or label column. Copied to ezlogs.state.record_names, which
 -- each post carries: EZLogs names each row from that column of the row it already got.
 CREATE TABLE IF NOT EXISTS ezlogs.record_names (table_oid oid PRIMARY KEY, column_name text NOT NULL);
 
+-- Columns a person told EZLogs to leave out (ezlogs.ignore_columns): a heartbeat such as
+-- last_seen_at. Never sent; an update that changed only these is not recorded.
+CREATE TABLE IF NOT EXISTS ezlogs.ignored_columns (table_oid oid PRIMARY KEY, columns text[] NOT NULL);
+
+-- One row per writing transaction (1.5.0): its deferred trigger ships at commit, once, however
+-- many rows the transaction wrote. Cleared at commit and by the flush job.
+CREATE TABLE IF NOT EXISTS ezlogs.tx_marks (
+  txid      bigint      PRIMARY KEY DEFAULT txid_current(),
+  marked_at timestamptz NOT NULL DEFAULT clock_timestamp()
+);
+
 -- ---------------------------------------------------------------------------------------
 -- Constants
 -- ---------------------------------------------------------------------------------------
 
-CREATE OR REPLACE FUNCTION ezlogs.version() RETURNS text LANGUAGE sql IMMUTABLE AS $$ SELECT '1.4.0' $$;
+CREATE OR REPLACE FUNCTION ezlogs.version() RETURNS text LANGUAGE sql IMMUTABLE AS $$ SELECT '1.5.1' $$;
 
 -- Where data goes. A constant, never a setting: nothing inside the database can point the
 -- capture at another host.
@@ -174,15 +237,15 @@ $$;
 CREATE OR REPLACE FUNCTION ezlogs.is_sensitive_key(k text) RETURNS boolean
   LANGUAGE sql IMMUTABLE
 AS $$
-  SELECT s ~ '(password|token|secret|api_key|credit_card|ssn|social_security|encrypted|private_key|public_key|signing_key|pem|cipher|nonce|salt|digest|signature|hmac|credential|passwd|passcode|apikey|card_number|cardnumber|cvv|cvc)'
-      OR lower(k) ~ '(password|token|secret|api_key|credit_card|ssn|social_security|encrypted|private_key|public_key|signing_key|pem|cipher|nonce|salt|digest|signature|hmac|credential|passwd|passcode|apikey|card_number|cardnumber|cvv|cvc)'
-      OR s ~ '(^|[^a-z0-9])(pin|otp|totp|iban|mfa|passphrase)([^a-z0-9]|$)'
+  SELECT s ~ '(password|token|secret|api_key|credit_card|ssn|social_security|encrypted|private_key|public_key|signing_key|pem|cipher|nonce|salt|digest|signature|hmac|credential|passwd|passcode|apikey|card_number|cardnumber|cvv|cvc|verification_code|recovery_code|backup_code|one_time_code|login_code)'
+      OR lower(k) ~ '(password|token|secret|api_key|credit_card|ssn|social_security|encrypted|private_key|public_key|signing_key|pem|cipher|nonce|salt|digest|signature|hmac|credential|passwd|passcode|apikey|card_number|cardnumber|cvv|cvc|verification_code|recovery_code|backup_code|one_time_code|login_code)'
+      OR s ~ '(^|[^a-z0-9])(pin|otp|totp|iban|mfa|passphrase|jti)([^a-z0-9]|$)'
     FROM (SELECT lower(regexp_replace(k, '([a-z0-9])([A-Z])', '\1_\2', 'g')) AS s) AS words
 $$;
 
 -- Bump whenever is_sensitive_key changes: triggers attached under another version fall back
 -- to checking every key and are re-attached by the next reconcile.
-CREATE OR REPLACE FUNCTION ezlogs.patterns_version() RETURNS text LANGUAGE sql IMMUTABLE AS $$ SELECT 'p1' $$;
+CREATE OR REPLACE FUNCTION ezlogs.patterns_version() RETURNS text LANGUAGE sql IMMUTABLE AS $$ SELECT 'p2' $$;
 
 CREATE OR REPLACE FUNCTION ezlogs.strip_sensitive(r jsonb) RETURNS jsonb
   LANGUAGE sql IMMUTABLE
@@ -196,6 +259,43 @@ $$;
 CREATE OR REPLACE FUNCTION ezlogs.size_marker(v jsonb) RETURNS jsonb
   LANGUAGE sql IMMUTABLE
 AS $$ SELECT to_jsonb(format('[%s bytes, not recorded]', octet_length(v::text))) $$;
+
+-- The same note from a stored size (pg_column_size), so a large value is never read.
+CREATE OR REPLACE FUNCTION ezlogs.size_note(bytes int) RETURNS jsonb
+  LANGUAGE sql IMMUTABLE
+AS $$ SELECT to_jsonb(format('[%s bytes, not recorded]', bytes)) $$;
+
+-- More rows than this in one statement are recorded as one bulk row (the server reads it as one
+-- bulk step, like Rails' update_all), never one row each.
+CREATE OR REPLACE FUNCTION ezlogs.bulk_threshold() RETURNS int LANGUAGE sql IMMUTABLE AS $$ SELECT 100 $$;
+
+-- Read once per transaction (ezlogs.begin_capture): when true, nothing is recorded (see state).
+CREATE OR REPLACE FUNCTION ezlogs.capture_paused() RETURNS boolean
+  LANGUAGE sql STABLE
+AS $$ SELECT EXISTS (SELECT 1 FROM ezlogs.state WHERE one AND capture_paused_at IS NOT NULL) $$;
+
+-- Called by every capture before it records: true to record, false while capture is paused.
+-- The first call in a transaction marks it (shipping then runs once, at its commit; while paused
+-- the commit still wakes the flush job, which resumes capture) and reads the pause flag; later
+-- calls in the same transaction read both from a transaction-local setting, never a table.
+CREATE OR REPLACE FUNCTION ezlogs.begin_capture() RETURNS boolean
+  LANGUAGE plpgsql
+  SET search_path = ezlogs, pg_temp
+AS $$
+DECLARE
+  tx     text := txid_current()::text;
+  cached text := current_setting('ezlogs.tx', true);
+  paused boolean;
+BEGIN
+  IF cached LIKE tx || ':%' THEN
+    RETURN cached = tx || ':record';
+  END IF;
+  INSERT INTO ezlogs.tx_marks (txid) VALUES (tx::bigint) ON CONFLICT DO NOTHING;
+  paused := ezlogs.capture_paused();
+  PERFORM set_config('ezlogs.tx', tx || CASE WHEN paused THEN ':paused' ELSE ':record' END, true);
+  RETURN NOT paused;
+END;
+$$;
 
 -- Inside a nested value (json, composite, array): drop sensitive keys at every level (a
 -- `settings` column holding {"stripe_secret_key": ...}). Depth-limited; values over 16 KB are
@@ -283,6 +383,9 @@ BEGIN
       'email',        left(c->>'email', 200),
       'name',         left(COALESCE(c->'user_metadata'->>'full_name', c->'user_metadata'->>'name'), 200),
       'client_id',    left(c->>'client_id', 200),
+      -- The login's session (auth.sessions id): names the person behind a browser report even when
+      -- auth.sessions can't be read or the session began before the install (1.5.0).
+      'session_id',   CASE WHEN c->>'session_id' ~ '^[0-9a-f-]{36}$' THEN c->>'session_id' END,
       -- The project's own auth address, from a token it signed: which Supabase project this is.
       'iss',          left(c->>'iss', 200),
       'is_anonymous', CASE WHEN jsonb_typeof(c->'is_anonymous') = 'boolean' THEN c->'is_anonymous' END
@@ -335,6 +438,9 @@ BEGIN
     old_c := CASE WHEN old_c IS NOT NULL THEN jsonb_build_object('note', 'row too large to record') END;
     new_c := CASE WHEN new_c IS NOT NULL THEN jsonb_build_object('note', 'row too large to record') END;
   END IF;
+  IF NOT ezlogs.begin_capture() THEN
+    RETURN;
+  END IF;
   INSERT INTO ezlogs.outbox (schema_name, table_name, op, old_row, new_row, resource_id, claims, correlation_id)
   VALUES (p_schema, p_table, p_op, old_c, new_c, left(p_resource_id, 200),
           ezlogs.request_claims(), ezlogs.request_correlation_id());
@@ -378,6 +484,10 @@ BEGIN
   ELSE
     old_json := ezlogs.strip_nested(old_raw);
     new_json := ezlogs.strip_nested(new_raw);
+    IF TG_NARGS >= 2 THEN   -- left-out columns too (secret-named ones are already gone)
+      old_json := old_json - TG_ARGV[1]::text[];
+      new_json := new_json - TG_ARGV[1]::text[];
+    END IF;
   END IF;
 
   IF TG_OP = 'UPDATE' AND old_json = new_json THEN
@@ -391,6 +501,182 @@ EXCEPTION WHEN others THEN
   -- Never break the app's write. Losing one change is recoverable; a failed save is not.
   RAISE WARNING '[ezlogs] capture on %.% failed (write continues): %', TG_TABLE_SCHEMA, TG_TABLE_NAME, SQLERRM;
   RETURN NULL;
+END;
+$$;
+
+-- 1.5.0: app tables with a one-column primary key are captured once per statement, not per row
+-- (three triggers: Postgres allows a transition table only on a single-event trigger), each by a
+-- function made for that table at attach (ezlogs.capture_source): one INSERT ... SELECT inside one
+-- exception block, whatever the row count, so an import or a bulk update never opens a
+-- subtransaction per row. Its select list leaves sensitive and ignored columns out and replaces
+-- bytea, vector, tsvector and any value over 8 KB by its stored size, never reading it.
+
+-- A captured row as it is stored: sensitive keys dropped inside json columns, oversized values
+-- replaced by their size, and a row that still would not fit in a post replaced by a note.
+CREATE OR REPLACE FUNCTION ezlogs.finish_row(j jsonb, jcols text[]) RETURNS jsonb
+  LANGUAGE plpgsql IMMUTABLE
+AS $$
+DECLARE
+  col text;
+BEGIN
+  IF j IS NULL THEN
+    RETURN NULL;
+  END IF;
+  FOREACH col IN ARRAY COALESCE(jcols, '{}') LOOP
+    IF j ? col THEN
+      j := jsonb_set(j, ARRAY[col], COALESCE(ezlogs.strip_nested(j->col, 1), 'null'));
+    END IF;
+  END LOOP;
+  IF pg_column_size(j) <= 8192 THEN
+    RETURN j;   -- small: nothing to cut (the common case, measured without serialising)
+  END IF;
+  j := ezlogs.cap_size(j);
+  IF octet_length(j::text) > 40960 THEN
+    RETURN jsonb_build_object('note', 'row too large to record');
+  END IF;
+  RETURN j;
+END;
+$$;
+
+-- An update's two images reduced to what changed, plus the columns it always keeps (its key and
+-- name columns); nothing (NULLs) when nothing changed.
+CREATE OR REPLACE FUNCTION ezlogs.diff_rows(old_j jsonb, new_j jsonb, keep text[], OUT old_out jsonb, OUT new_out jsonb)
+  LANGUAGE plpgsql IMMUTABLE
+AS $$
+DECLARE
+  keys text[];
+BEGIN
+  SELECT array_agg(e.key) INTO keys FROM jsonb_each(new_j) e WHERE (old_j -> e.key) IS DISTINCT FROM e.value;
+  IF keys IS NULL THEN
+    RETURN;
+  END IF;
+  SELECT jsonb_object_agg(k, old_j -> k) FILTER (WHERE old_j ? k),
+         jsonb_object_agg(k, new_j -> k) FILTER (WHERE new_j ? k)
+    INTO old_out, new_out
+    FROM (SELECT DISTINCT unnest(keys || COALESCE(keep, '{}')) AS k) u;
+END;
+$$;
+
+-- An update over this many rows is recorded with its row count only: summarising every column of
+-- every row would add seconds to a very large statement (and to the app's statement timeout).
+CREATE OR REPLACE FUNCTION ezlogs.bulk_summary_max() RETURNS int LANGUAGE sql IMMUTABLE AS $$ SELECT 10000 $$;
+
+-- The equality operator of a type, schema-qualified (pgvector's and citext's live outside
+-- pg_catalog, and capture runs with search_path = ezlogs); NULL when the type has none.
+CREATE OR REPLACE FUNCTION ezlogs.eq_op(typ oid) RETURNS text
+  LANGUAGE sql STABLE
+AS $$
+  -- The type's own, else the one of a type it converts to without change (varchar uses text's).
+  SELECT format('OPERATOR(%I.=)', n.nspname)
+    FROM pg_operator o JOIN pg_namespace n ON n.oid = o.oprnamespace
+   WHERE o.oprname = '=' AND o.oprresult = 'boolean'::regtype
+     AND ((o.oprleft = typ AND o.oprright = typ)
+          OR (o.oprleft = o.oprright AND o.oprleft IN (SELECT casttarget FROM pg_cast
+                                                        WHERE castsource = typ AND castmethod = 'b' AND castcontext = 'i')))
+   ORDER BY o.oprleft = typ DESC, n.nspname = 'pg_catalog' DESC
+   LIMIT 1
+$$;
+
+-- Whether a column differs between an update's old (o) and new (n) row, for the bulk summary: the
+-- text form, which is exact for every type (a type's own "=" can call different values equal:
+-- box by area, interval '1 day' and '24 hours', citext by case). Binary types use their own equality.
+CREATE OR REPLACE FUNCTION ezlogs.changed_expr(col text, typ oid) RETURNS text
+  LANGUAGE sql STABLE
+AS $$
+  SELECT CASE WHEN (SELECT typname FROM pg_type WHERE oid = typ) IN ('bytea', 'vector', 'halfvec', 'sparsevec')
+                   AND ezlogs.eq_op(typ) IS NOT NULL
+              THEN format('((n.%1$I IS NULL) <> (o.%1$I IS NULL) OR NOT (n.%1$I %2$s o.%1$I))', col, ezlogs.eq_op(typ))
+              ELSE format('(n.%1$I::text IS DISTINCT FROM o.%1$I::text)', col) END
+$$;
+
+-- The body of one table's capture function for one operation (ezlogs.attach creates it as
+-- ezlogs.cap_<table oid>_<ins|upd|del>_<suffix>). Static SQL, so Postgres plans it once per
+-- connection, not once per statement. Every name and value is quoted here. Variables are always
+-- written fn.<name> and columns win any other clash (#variable_conflict use_column), so a column
+-- named like a variable (summary, claims, new, found) can't break it. pk_eq: the key type's
+-- equality operator (ezlogs.eq_op).
+CREATE OR REPLACE FUNCTION ezlogs.capture_source(op text, tbl text, pk text, pk_eq text, sel text, jcols text[], keep text[],
+                                                 summary text)
+  RETURNS text
+  LANGUAGE plpgsql IMMUTABLE
+AS $$
+DECLARE
+  tr      text := CASE op WHEN 'DELETE' THEN 'o' ELSE 'n' END;   -- the transition table read
+  samples text := format('(SELECT jsonb_agg(x) FROM (SELECT t.%I::text AS x FROM %s t LIMIT 5) s)', pk, tr);
+  bulk    text;
+  rows_q  text;
+BEGIN
+  IF op = 'UPDATE' THEN
+    -- A statement that changed keys: its old and new rows can't be paired, so it is recorded as a
+    -- count (never as one row's values moved onto another).
+    rows_q := format(
+      'IF EXISTS (SELECT 1 FROM n nk WHERE NOT EXISTS (SELECT 1 FROM o ok WHERE ok.%1$I %5$s nk.%1$I)) THEN '
+      '  INSERT INTO ezlogs.outbox (schema_name, table_name, op, row_count, bulk, claims, correlation_id) '
+      '  VALUES (''public'', %2$L, ''UPDATE'', fn.cnt, jsonb_build_object(''columns'', jsonb_build_object(%1$L, ''{"changed": true}''::jsonb), ''sample_ids'', %3$s), fn.claims, fn.cid); '
+      'ELSE '
+      '  INSERT INTO ezlogs.outbox (schema_name, table_name, op, old_row, new_row, resource_id, claims, correlation_id) '
+      '  SELECT ''public'', %2$L, ''UPDATE'', d.old_out, d.new_out, left(nw.%1$I::text, 200), fn.claims, fn.cid '
+      '  FROM (SELECT %4$s FROM n) nw JOIN (SELECT %4$s FROM o) od ON od.%1$I %5$s nw.%1$I '
+      '  CROSS JOIN LATERAL ezlogs.diff_rows(ezlogs.finish_row(to_jsonb(od.*), %6$L::text[]), ezlogs.finish_row(to_jsonb(nw.*), %6$L::text[]), %7$L::text[]) d '
+      '  WHERE d.new_out IS NOT NULL; '
+      'END IF;',
+      pk, tbl, samples, sel, pk_eq, jcols, keep);
+    bulk := format(
+      'IF fn.cnt <= ezlogs.bulk_summary_max() AND NOT EXISTS (SELECT nk.%1$I FROM n nk EXCEPT ALL SELECT ok.%1$I FROM o ok) THEN '
+      '  SELECT jsonb_build_object(''columns'', %2$s, ''sample_ids'', %3$s) INTO fn.summary FROM n JOIN o ON o.%1$I %4$s n.%1$I; '
+      '  IF fn.summary IS NULL OR fn.summary->''columns'' = ''{}''::jsonb THEN RETURN NULL; END IF; '
+      'ELSE '
+      '  fn.summary := jsonb_build_object(''sample_ids'', %3$s); '
+      'END IF; '
+      'INSERT INTO ezlogs.outbox (schema_name, table_name, op, row_count, bulk, claims, correlation_id) '
+      'VALUES (''public'', %5$L, ''UPDATE'', fn.cnt, fn.summary, fn.claims, fn.cid);',
+      pk, COALESCE(NULLIF(summary, ''), '''{}''::jsonb'), samples, pk_eq, tbl);
+  ELSE
+    bulk := format(
+      'INSERT INTO ezlogs.outbox (schema_name, table_name, op, row_count, bulk, claims, correlation_id) '
+      'VALUES (''public'', %1$L, %2$L, fn.cnt, jsonb_build_object(''sample_ids'', %3$s), fn.claims, fn.cid);',
+      tbl, op, samples);
+    rows_q := format(
+      'INSERT INTO ezlogs.outbox (schema_name, table_name, op, %1$s, resource_id, claims, correlation_id) '
+      'SELECT ''public'', %2$L, %3$L, ezlogs.finish_row(to_jsonb(s.*), %4$L::text[]), left(s.%5$I::text, 200), fn.claims, fn.cid '
+      'FROM (SELECT %6$s FROM %7$s) s;',
+      CASE op WHEN 'DELETE' THEN 'old_row' ELSE 'new_row' END, tbl, op, jcols, pk, sel, tr);
+  END IF;
+  RETURN format($body$
+#variable_conflict use_column
+<<fn>>
+DECLARE
+  cnt     bigint;
+  claims  jsonb;
+  cid     text;
+  summary jsonb;
+BEGIN
+  SELECT count(*) INTO fn.cnt FROM %1$s;
+  IF fn.cnt = 0 OR NOT ezlogs.begin_capture() THEN
+    RETURN NULL;
+  END IF;
+  fn.claims := ezlogs.request_claims();
+  fn.cid := ezlogs.request_correlation_id();
+  IF fn.cnt > ezlogs.bulk_threshold() THEN
+    %2$s
+  ELSE
+    %3$s
+  END IF;
+  RETURN NULL;
+EXCEPTION WHEN others THEN
+  -- Never break the app's write. Losing one statement's changes is recoverable; a failed save is not.
+  RAISE WARNING '[ezlogs] capture on %%.%% failed (write continues): %%', TG_TABLE_SCHEMA, TG_TABLE_NAME, SQLERRM;
+  -- Most often the table changed and this function is out of date (a host without event triggers):
+  -- at commit, the flush job is asked to re-attach tables (ezlogs.ship_at_commit).
+  BEGIN
+    PERFORM set_config('ezlogs.capture_failed', '1', true);
+    PERFORM ezlogs.begin_capture();
+  EXCEPTION WHEN others THEN
+    NULL;
+  END;
+  RETURN NULL;
+END;
+$body$, tr, bulk, rows_q);
 END;
 $$;
 
@@ -414,6 +700,7 @@ AS $$
     'email_confirmed_at', j->'email_confirmed_at',
     'phone_confirmed_at', j->'phone_confirmed_at',
     'last_sign_in_at',    j->'last_sign_in_at',
+    'recovery_sent_at',   j->'recovery_sent_at',
     'banned_until',       j->'banned_until',
     'deleted_at',         j->'deleted_at',
     'is_anonymous',       j->'is_anonymous'))
@@ -430,6 +717,10 @@ DECLARE
 BEGIN
   IF TG_OP <> 'INSERT' THEN old_json := ezlogs.auth_user_view(to_jsonb(OLD)); END IF;
   IF TG_OP <> 'DELETE' THEN new_json := ezlogs.auth_user_view(to_jsonb(NEW)); END IF;
+  -- A password change is only a fact: that the hash differs. Nothing derived from it is kept.
+  IF TG_OP = 'UPDATE' AND to_jsonb(OLD)->>'encrypted_password' IS DISTINCT FROM to_jsonb(NEW)->>'encrypted_password' THEN
+    new_json := new_json || '{"pw_changed": true}'::jsonb;
+  END IF;
   IF TG_OP = 'UPDATE' AND old_json = new_json THEN
     RETURN NULL;
   END IF;
@@ -520,6 +811,40 @@ $$;
 -- Attach (or refresh) the capture trigger on one public table, unless it is skipped or a
 -- person excluded it. Leaves a table whose trigger already has the current arguments alone.
 -- Never waits for a table lock: a busy table is attached on a later run.
+-- What a table's capture triggers were built from: its columns and their types, its key, the
+-- columns left out or naming its rows, and the rules version. Stored as the triggers' last
+-- argument, so a schema change (even on a host without event triggers) re-attaches the table.
+CREATE OR REPLACE FUNCTION ezlogs.table_signature(target regclass) RETURNS text
+  LANGUAGE sql STABLE
+  SET search_path = ezlogs, pg_temp
+AS $$
+  SELECT md5(concat_ws('|', ezlogs.version(), ezlogs.patterns_version(),
+    (SELECT relname FROM pg_class WHERE oid = target),   -- a renamed table is recorded under its new name
+    (SELECT string_agg(a.attnum || ':' || a.attname || ':' || a.atttypid, ',' ORDER BY a.attnum)
+       FROM pg_attribute a WHERE a.attrelid = target AND a.attnum > 0 AND NOT a.attisdropped),
+    (SELECT string_agg(i.indkey::text, ',') FROM pg_index i WHERE i.indrelid = target AND i.indisprimary),
+    (SELECT string_agg(c.condeferrable::text, ',') FROM pg_constraint c WHERE c.conrelid = target AND c.contype = 'p'),
+    (SELECT columns::text FROM ezlogs.ignored_columns WHERE table_oid = target),
+    (SELECT column_name FROM ezlogs.record_names WHERE table_oid = target)))
+$$;
+
+-- A column's name as EZLogs' server compares it (lowercase, no underscores), and the table's
+-- `<record>number` column in that form: the same rules as EventIngest::PostgresRows#singular_norm.
+CREATE OR REPLACE FUNCTION ezlogs.name_norm(name text) RETURNS text
+  LANGUAGE sql IMMUTABLE
+AS $$ SELECT lower(replace(name, '_', '')) $$;
+
+CREATE OR REPLACE FUNCTION ezlogs.numbered_norm(table_name text) RETURNS text
+  LANGUAGE sql IMMUTABLE
+AS $$
+  SELECT CASE WHEN t ~ 'ies$' THEN left(t, -3) || 'y'
+              WHEN t ~ '(ss|us|is)$' THEN t
+              WHEN t ~ '(xes|ches|shes|sses)$' THEN left(t, -2)
+              WHEN t ~ 's$' THEN left(t, -1)
+              ELSE t END || 'number'
+    FROM (SELECT ezlogs.name_norm(table_name) AS t) n
+$$;
+
 CREATE OR REPLACE FUNCTION ezlogs.attach(target regclass, by_person boolean DEFAULT false) RETURNS boolean
   LANGUAGE plpgsql
   SECURITY DEFINER
@@ -527,29 +852,210 @@ CREATE OR REPLACE FUNCTION ezlogs.attach(target regclass, by_person boolean DEFA
   SET lock_timeout = '100ms'
 AS $$
 DECLARE
-  rel     pg_class%ROWTYPE;
-  pk      text;
-  secret  text[];
-  cols    text[];
-  jcols   text[];
-  argv    text[];
+  rel      pg_class%ROWTYPE;
+  pk       text;
+  pk_type  oid;
+  pk_eq    text;
+  jcols    text[];
+  ignored  text[];
+  sig      text;
+  op       text;
+  fname    text;
+  sel      text;
+  sel_upd  text;
+  keep     text[];
+  summary  text;
+  suffix   text;
 BEGIN
   SELECT * INTO rel FROM pg_class WHERE oid = target;
-  IF NOT FOUND OR rel.relnamespace <> 'public'::regnamespace OR rel.relkind NOT IN ('r', 'p') OR rel.relispartition
-     OR (NOT by_person AND ezlogs.skipped(rel.relname))
+  IF NOT FOUND THEN
+    RETURN false;
+  END IF;
+  -- A partition is captured by its parent's row trigger (cloned onto it): a table attached as a
+  -- partition after it was tracked on its own loses its own triggers, so nothing is recorded twice.
+  IF rel.relispartition THEN
+    IF EXISTS (SELECT 1 FROM pg_trigger WHERE tgrelid = target AND tgname LIKE 'ezlogs\_capture%' AND tgparentid = 0) THEN
+      PERFORM ezlogs.detach(target);
+    END IF;
+    RETURN false;
+  END IF;
+  -- A table whose name is skipped is recorded only when a person tracked it (ezlogs.track).
+  IF rel.relnamespace <> 'public'::regnamespace OR rel.relkind NOT IN ('r', 'p')
+     OR (NOT by_person AND ezlogs.skipped(rel.relname) AND NOT EXISTS (SELECT 1 FROM ezlogs.tracked k WHERE k.table_oid = target))
      OR EXISTS (SELECT 1 FROM ezlogs.excluded e WHERE e.table_oid = target) THEN
+    IF EXISTS (SELECT 1 FROM pg_trigger WHERE tgrelid = target AND tgname LIKE 'ezlogs\_capture%' AND tgparentid = 0)
+       AND rel.relnamespace = 'public'::regnamespace THEN
+      PERFORM ezlogs.detach(target);   -- renamed to a name EZLogs skips (a secrets table): stop recording it
+    END IF;
     RETURN false;
   END IF;
 
-  SELECT a.attname INTO pk
+  SELECT a.attname, CASE WHEN t.typtype = 'd' THEN t.typbasetype ELSE t.oid END INTO pk, pk_type
     FROM pg_index i JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
+    JOIN pg_type t ON t.oid = a.atttypid
    WHERE i.indrelid = target AND i.indisprimary AND array_length(i.indkey, 1) = 1
    LIMIT 1;
+  pk_eq := ezlogs.eq_op(pk_type);
+  SELECT columns INTO ignored FROM ezlogs.ignored_columns WHERE table_oid = target;
+  ignored := COALESCE(ignored, '{}');
 
-  SELECT COALESCE(array_agg(a.attname::text) FILTER (WHERE ezlogs.is_sensitive_key(a.attname)), '{}'),
+  -- One trigger per row, as before 1.5.0, for a table without a one-column key (an update's old
+  -- and new rows can't be paired) and for a partitioned table (a statement trigger on the parent
+  -- misses writes made to a partition directly; a row trigger is cloned onto every partition).
+  -- A deferrable key can be swapped within one statement (id = 3 - id), which would pair rows wrongly.
+  IF pk IS NULL OR pk_eq IS NULL OR ezlogs.is_sensitive_key(pk) OR rel.relkind = 'p'
+     OR EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = target AND contype = 'p' AND condeferrable) THEN
+    RETURN ezlogs.attach_rows(target, rel, pk);
+  END IF;
+
+  -- The select list: each column EZLogs may record, large values replaced by their stored size.
+  SELECT string_agg(
+           CASE
+             WHEN a.attname = pk THEN format('%I', a.attname)   -- the key as it is: it names the row
+             WHEN bt.typname IN ('bytea', 'vector', 'halfvec', 'sparsevec', 'tsvector', 'tsquery') THEN
+               format('CASE WHEN %1$I IS NULL THEN NULL ELSE ezlogs.size_note(pg_column_size(%1$I)) END AS %1$I', a.attname)
+             WHEN t.typlen = -1 THEN
+               format('CASE WHEN pg_column_size(%1$I) > 8192 THEN ezlogs.size_note(pg_column_size(%1$I)) ELSE to_jsonb(%1$I) END AS %1$I', a.attname)
+             ELSE format('%I', a.attname)
+           END, ', ' ORDER BY a.attnum),
+         COALESCE(array_agg(a.attname::text ORDER BY a.attnum) FILTER (
+           WHERE bt.typname IN ('json', 'jsonb', 'hstore') OR bt.typtype = 'c' OR bt.typcategory = 'A'), '{}'),
+         -- An update's rows (at most bulk_threshold() of them): a large value measured by its text
+         -- length on both sides, so a value the statement only sent again never reads as changed
+         -- (stored sizes differ between a compressed old value and a new one).
+         string_agg(
+           CASE
+             WHEN a.attname = pk THEN format('%I', a.attname)
+             WHEN bt.typname = 'bytea' THEN
+               format('CASE WHEN %1$I IS NULL THEN NULL ELSE ezlogs.size_note(octet_length(%1$I)) END AS %1$I', a.attname)
+             WHEN bt.typname IN ('vector', 'halfvec', 'sparsevec', 'tsvector', 'tsquery') THEN
+               format('CASE WHEN %1$I IS NULL THEN NULL ELSE ezlogs.size_note(octet_length(%1$I::text)) END AS %1$I', a.attname)
+             WHEN t.typlen = -1 THEN
+               format('CASE WHEN octet_length(%1$I::text) > 8192 THEN ezlogs.size_note(octet_length(%1$I::text)) ELSE to_jsonb(%1$I) END AS %1$I', a.attname)
+             ELSE format('%I', a.attname)
+           END, ', ' ORDER BY a.attnum),
+         -- An update's summary when it changed more than bulk_threshold() rows: each changed column,
+         -- with its new value (as text, at most 200 bytes) when every row got the same one, else
+         -- {"changed": true}. Nested types (json: secrets inside) and large ones never carry a value.
+         -- Compared by their text form (exact). A value stored over 8 KB is read only when its stored
+         -- size differs from the other side's (an untouched value keeps its stored form and size; a
+         -- re-sent one differs in form): a same-size change to a large value is not seen here.
+         string_agg(
+           CASE WHEN a.attname = pk THEN NULL   -- rows are paired by it: it never changes here
+           ELSE format('CASE WHEN bool_or(%2$s) THEN jsonb_build_object(%1$L, %3$s) ELSE ''{}''::jsonb END',
+                  a.attname,
+                  CASE WHEN t.typlen = -1
+                       THEN format('CASE WHEN pg_column_size(n.%1$I) > 8192 OR pg_column_size(o.%1$I) > 8192 '
+                                   'THEN CASE WHEN pg_column_size(n.%1$I) IS NOT DISTINCT FROM pg_column_size(o.%1$I) THEN false '
+                                   'ELSE %2$s END ELSE %2$s END',
+                                   a.attname, ezlogs.changed_expr(a.attname, bt.oid))
+                       ELSE ezlogs.changed_expr(a.attname, bt.oid) END,
+                  CASE WHEN bt.typname IN ('bytea', 'vector', 'halfvec', 'sparsevec', 'tsvector', 'tsquery', 'json', 'jsonb', 'hstore')
+                         OR bt.typtype = 'c' OR bt.typcategory = 'A'
+                       THEN '''{"changed": true}''::jsonb'
+                       ELSE format('CASE WHEN count(n.%1$I) = 0 THEN ''null''::jsonb '
+                                   'WHEN count(n.%1$I) FILTER (WHERE pg_column_size(n.%1$I) <= 256) = count(*) '
+                                   'AND min(n.%1$I::text) FILTER (WHERE pg_column_size(n.%1$I) <= 256) '
+                                   '  = max(n.%1$I::text) FILTER (WHERE pg_column_size(n.%1$I) <= 256) '
+                                   'AND octet_length(min(n.%1$I::text) FILTER (WHERE pg_column_size(n.%1$I) <= 256)) <= 200 '
+                                   'THEN to_jsonb(min(n.%1$I::text) FILTER (WHERE pg_column_size(n.%1$I) <= 256)) '
+                                   'ELSE ''{"changed": true}''::jsonb END', a.attname) END)
+           END, ' || ' ORDER BY a.attnum)
+    INTO sel, jcols, sel_upd, summary
+    FROM pg_attribute a
+    JOIN pg_type t ON t.oid = a.atttypid
+    JOIN pg_type bt ON bt.oid = CASE WHEN t.typtype = 'd' THEN t.typbasetype ELSE t.oid END
+   WHERE a.attrelid = target AND a.attnum > 0 AND NOT a.attisdropped
+     AND NOT ezlogs.is_sensitive_key(a.attname) AND (a.attname = pk OR NOT a.attname = ANY(ignored));
+
+  -- What an update always carries besides its changes: the key, and the columns that name a row,
+  -- matched as the server matches them (name, title, number, label, <record>_number, any case or
+  -- underscores) and the one set with ezlogs.name_records.
+  SELECT array_agg(a.attname::text) INTO keep
+    FROM pg_attribute a
+   WHERE a.attrelid = target AND a.attnum > 0 AND NOT a.attisdropped AND NOT ezlogs.is_sensitive_key(a.attname)
+     AND NOT a.attname = ANY(ignored)
+     AND (a.attname = pk OR ezlogs.name_norm(a.attname) IN ('name', 'title', 'number', 'label', ezlogs.numbered_norm(rel.relname))
+          OR a.attname = (SELECT column_name FROM ezlogs.record_names WHERE table_oid = target));
+  keep := array_append(array_remove(keep, pk), pk);
+
+  sig := ezlogs.table_signature(target);
+  -- Already attached by this version for these columns: leave it (no lock, no catalog churn).
+  IF (SELECT count(*) FROM pg_trigger t JOIN pg_proc f ON f.oid = t.tgfoid
+       WHERE t.tgrelid = target AND t.tgparentid = 0
+         AND t.tgname IN ('ezlogs_capture_ins', 'ezlogs_capture_upd', 'ezlogs_capture_del')
+         AND f.pronamespace = 'ezlogs'::regnamespace AND f.proname ~ '^cap_[0-9]+_(ins|upd|del)_[0-9a-f]{8}$'
+         AND t.tgargs = convert_to(sig, 'UTF8') || '\x00'::bytea) = 3
+     AND NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'ezlogs_capture' AND tgrelid = target) THEN
+    RETURN true;
+  END IF;
+
+  PERFORM ezlogs.detach(target);
+  -- Function names carry a fresh suffix, so they never collide with functions a restore brought
+  -- back under another table's old oid.
+  suffix := left(md5(sig || clock_timestamp()::text || random()::text), 8);
+  FOREACH op IN ARRAY ARRAY['INSERT', 'UPDATE', 'DELETE'] LOOP
+    fname := format('cap_%s_%s_%s', target::oid, lower(left(op, 3)), suffix);
+    EXECUTE format('CREATE FUNCTION ezlogs.%I() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER '
+                   'SET search_path = ezlogs, pg_temp AS %L', fname,
+                   ezlogs.capture_source(op, rel.relname, pk, pk_eq,
+                                         CASE op WHEN 'UPDATE' THEN COALESCE(sel_upd, format('%I', pk)) ELSE COALESCE(sel, format('%I', pk)) END,
+                                         jcols, keep, summary));
+    EXECUTE format('REVOKE ALL ON FUNCTION ezlogs.%I() FROM PUBLIC', fname);
+    EXECUTE format('CREATE TRIGGER %I AFTER %s ON %s REFERENCING %s FOR EACH STATEMENT EXECUTE FUNCTION ezlogs.%I(%L)',
+                   'ezlogs_capture_' || lower(left(op, 3)), op, target,
+                   CASE op WHEN 'INSERT' THEN 'NEW TABLE AS n' WHEN 'DELETE' THEN 'OLD TABLE AS o'
+                           ELSE 'OLD TABLE AS o NEW TABLE AS n' END,
+                   fname, sig);
+  END LOOP;
+  RETURN true;
+END;
+$$;
+
+-- Every EZLogs capture trigger of a table, whichever kind (row or statement; a partition's clones
+-- go with its parent's), and the capture functions those triggers used.
+CREATE OR REPLACE FUNCTION ezlogs.detach(target regclass) RETURNS void
+  LANGUAGE plpgsql
+  SECURITY DEFINER
+  SET search_path = ezlogs, pg_temp
+AS $$
+DECLARE
+  tg    record;
+  funcs oid[];
+BEGIN
+  SELECT array_agg(DISTINCT tgfoid) INTO funcs
+    FROM pg_trigger WHERE tgrelid = target AND tgname LIKE 'ezlogs\_capture%' AND NOT tgisinternal AND tgparentid = 0;
+  FOR tg IN SELECT tgname FROM pg_trigger
+             WHERE tgrelid = target AND tgname LIKE 'ezlogs\_capture%' AND NOT tgisinternal AND tgparentid = 0 LOOP
+    EXECUTE format('DROP TRIGGER IF EXISTS %I ON %s', tg.tgname, target);
+  END LOOP;
+  FOR tg IN SELECT p.oid::regprocedure AS f FROM pg_proc p
+             WHERE p.oid = ANY(COALESCE(funcs, '{}')) AND p.pronamespace = 'ezlogs'::regnamespace AND p.proname ~ '^cap_'
+               AND NOT EXISTS (SELECT 1 FROM pg_trigger t WHERE t.tgfoid = p.oid) LOOP
+    EXECUTE format('DROP FUNCTION IF EXISTS %s', tg.f);
+  END LOOP;
+END;
+$$;
+
+-- A table without a one-column key: one row trigger (ezlogs.capture_row), the 1.4.0 way.
+CREATE OR REPLACE FUNCTION ezlogs.attach_rows(target regclass, rel pg_class, pk text) RETURNS boolean
+  LANGUAGE plpgsql
+  SECURITY DEFINER
+  SET search_path = ezlogs, pg_temp
+AS $$
+DECLARE
+  secret text[];
+  cols   text[];
+  jcols  text[];
+  argv   text[];
+  trig_name text;
+  part      regclass;
+BEGIN
+  -- Dropped from every row: secret-named columns and the ones a person left out (ignore_columns).
+  SELECT COALESCE(array_agg(a.attname::text) FILTER (
+           WHERE ezlogs.is_sensitive_key(a.attname)
+              OR a.attname = ANY(COALESCE((SELECT columns FROM ezlogs.ignored_columns WHERE table_oid = target), '{}'))), '{}'),
          ARRAY(SELECT jsonb_object_keys(jsonb_object_agg(a.attname, NULL::int))),
-         -- Columns that become nested json (json, composite, arrays, hstore, domains over them):
-         -- walked for sensitive keys.
          COALESCE(array_agg(a.attname::text) FILTER (
            WHERE NOT ezlogs.is_sensitive_key(a.attname)
              AND (bt.typname IN ('json', 'jsonb', 'hstore') OR bt.typtype = 'c' OR bt.typcategory = 'A')), '{}')
@@ -559,23 +1065,30 @@ BEGIN
     JOIN pg_type bt ON bt.oid = CASE WHEN t.typtype = 'd' THEN t.typbasetype ELSE t.oid END
    WHERE a.attrelid = target AND a.attnum > 0 AND NOT a.attisdropped;
 
-  argv := ARRAY[COALESCE(pk, ''), secret::text, cols::text, ezlogs.patterns_version(), rel.relname, jcols::text];
-
-  -- Already attached with exactly these arguments: leave it (no lock, no catalog churn).
-  -- Compared on the stored function and raw arguments (tgargs: each argument + a zero byte).
+  argv := ARRAY[COALESCE(pk, ''), secret::text, cols::text, ezlogs.patterns_version(), rel.relname, jcols::text,
+                ezlogs.table_signature(target)];
+  -- A partitioned table's trigger is cloned onto every partition: its own name, so attaching a table
+  -- that has its own capture as a partition never fails on a name clash.
+  trig_name := CASE WHEN rel.relkind = 'p' THEN 'ezlogs_capture_part' ELSE 'ezlogs_capture' END;
+  IF rel.relkind = 'p' THEN
+    FOR part IN SELECT inhrelid::regclass FROM pg_inherits WHERE inhparent = target LOOP
+      IF EXISTS (SELECT 1 FROM pg_trigger WHERE tgrelid = part AND tgname LIKE 'ezlogs\_capture%' AND tgparentid = 0) THEN
+        PERFORM ezlogs.detach(part);
+      END IF;
+    END LOOP;
+  END IF;
   IF EXISTS (SELECT 1 FROM pg_trigger t
-              WHERE t.tgname = 'ezlogs_capture' AND t.tgrelid = target
+              WHERE t.tgname = trig_name AND t.tgrelid = target
                 AND t.tgfoid = 'ezlogs.capture_row'::regproc
                 AND t.tgargs = (SELECT string_agg(convert_to(a, 'UTF8') || '\x00'::bytea, ''::bytea ORDER BY n)
-                                  FROM unnest(argv) WITH ORDINALITY AS u(a, n))) THEN
+                                  FROM unnest(argv) WITH ORDINALITY AS u(a, n)))
+     AND NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname LIKE 'ezlogs\_capture%' AND tgname <> trig_name
+                      AND tgrelid = target AND tgparentid = 0) THEN
     RETURN true;
   END IF;
-
-  IF EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'ezlogs_capture' AND tgrelid = target) THEN
-    EXECUTE format('DROP TRIGGER ezlogs_capture ON %s', target);
-  END IF;
-  EXECUTE format('CREATE TRIGGER ezlogs_capture AFTER INSERT OR UPDATE OR DELETE ON %s '
-                 'FOR EACH ROW EXECUTE FUNCTION ezlogs.capture_row(%s)', target,
+  PERFORM ezlogs.detach(target);
+  EXECUTE format('CREATE TRIGGER %I AFTER INSERT OR UPDATE OR DELETE ON %s '
+                 'FOR EACH ROW EXECUTE FUNCTION ezlogs.capture_row(%s)', trig_name, target,
                  (SELECT string_agg(quote_literal(a), ', ' ORDER BY n) FROM unnest(argv) WITH ORDINALITY AS u(a, n)));
   RETURN true;
 END;
@@ -589,6 +1102,7 @@ CREATE OR REPLACE FUNCTION ezlogs.track(target regclass) RETURNS boolean
 AS $$
 BEGIN
   DELETE FROM ezlogs.excluded WHERE table_oid = target;
+  INSERT INTO ezlogs.tracked (table_oid) VALUES (target) ON CONFLICT DO NOTHING;
   RETURN ezlogs.attach(target, by_person => true);
 END;
 $$;
@@ -622,6 +1136,7 @@ BEGIN
   IF column_name IS NULL THEN
     DELETE FROM ezlogs.record_names WHERE table_oid = t;
     PERFORM ezlogs.refresh_record_names();
+    PERFORM ezlogs.attach(t);
     RETURN format('%s rows are named by their default columns again (name, title, number, label)', t);
   END IF;
   IF NOT EXISTS (SELECT 1 FROM pg_attribute
@@ -638,6 +1153,7 @@ BEGIN
   INSERT INTO ezlogs.record_names (table_oid, column_name) VALUES (t, column_name)
     ON CONFLICT (table_oid) DO UPDATE SET column_name = EXCLUDED.column_name;
   PERFORM ezlogs.refresh_record_names();
+  PERFORM ezlogs.attach(t); -- an update always carries the name column
   RETURN format('%s rows are named by %s', t, column_name);
 END;
 $$;
@@ -666,6 +1182,56 @@ AS $$
   UPDATE ezlogs.state SET record_names = ezlogs.record_names_json() WHERE one;
 $$;
 
+-- For people: leave a table's noisy columns out (a heartbeat such as last_seen_at), never sent;
+-- an update that changed only these is not recorded. select ezlogs.ignore_columns('public.profiles',
+-- ARRAY['last_seen_at']); an empty array or NULL forgets the setting. Safe in a migration, guarded
+-- like name_records. Refuses a table EZLogs doesn't record or a column it doesn't have.
+CREATE OR REPLACE FUNCTION ezlogs.ignore_columns(target text, column_names text[]) RETURNS text
+  LANGUAGE plpgsql
+  SECURITY DEFINER
+  SET search_path = ezlogs, pg_temp
+AS $$
+DECLARE
+  t       regclass := to_regclass(target);
+  rel     pg_class%ROWTYPE;
+  missing text;
+BEGIN
+  IF t IS NULL THEN
+    RAISE EXCEPTION 'ezlogs.ignore_columns: there is no table %', target
+      USING HINT = 'Write it as schema.table, for example ''public.profiles''.';
+  END IF;
+  SELECT * INTO rel FROM pg_class WHERE oid = t;
+  IF rel.relnamespace <> 'public'::regnamespace OR rel.relkind NOT IN ('r', 'p') OR rel.relispartition THEN
+    RAISE EXCEPTION 'ezlogs.ignore_columns: % is not one of the app''s tables EZLogs records (a table in public)', t;
+  END IF;
+  IF array_position(column_names, NULL) IS NOT NULL THEN
+    RAISE EXCEPTION 'ezlogs.ignore_columns: a column name is missing (NULL) in the list';
+  END IF;
+  IF COALESCE(cardinality(column_names), 0) = 0 THEN
+    DELETE FROM ezlogs.ignored_columns WHERE table_oid = t;
+    PERFORM ezlogs.attach(t);
+    RETURN format('%s: no columns left out', t);
+  END IF;
+  SELECT c INTO missing FROM unnest(column_names) c
+   WHERE NOT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = t AND attname = c AND attnum > 0 AND NOT attisdropped)
+   LIMIT 1;
+  IF missing IS NOT NULL THEN
+    RAISE EXCEPTION 'ezlogs.ignore_columns: % has no column %', t, missing;
+  END IF;
+  SELECT a.attname INTO missing
+    FROM pg_index i JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
+   WHERE i.indrelid = t AND i.indisprimary AND a.attname = ANY(column_names)
+   LIMIT 1;
+  IF missing IS NOT NULL THEN
+    RAISE EXCEPTION 'ezlogs.ignore_columns: % is part of the primary key of %, which names each row, so it can''t be left out', missing, t;
+  END IF;
+  INSERT INTO ezlogs.ignored_columns (table_oid, columns) VALUES (t, column_names)
+    ON CONFLICT (table_oid) DO UPDATE SET columns = EXCLUDED.columns;
+  PERFORM ezlogs.attach(t);
+  RETURN format('%s: leaving out %s', t, array_to_string(column_names, ', '));
+END;
+$$;
+
 -- For people: stop recording a table, for good (until ezlogs.track). Survives renames.
 CREATE OR REPLACE FUNCTION ezlogs.untrack(target regclass) RETURNS void
   LANGUAGE plpgsql
@@ -674,7 +1240,8 @@ CREATE OR REPLACE FUNCTION ezlogs.untrack(target regclass) RETURNS void
 AS $$
 BEGIN
   INSERT INTO ezlogs.excluded (table_oid) VALUES (target) ON CONFLICT DO NOTHING;
-  EXECUTE format('DROP TRIGGER IF EXISTS ezlogs_capture ON %s', target);
+  DELETE FROM ezlogs.tracked WHERE table_oid = target;
+  PERFORM ezlogs.detach(target);
 END;
 $$;
 
@@ -731,30 +1298,119 @@ BEGIN
 END;
 $$;
 
+-- Capture functions (cap_<oid>_*) whose table is gone: at most 100 per call.
+CREATE OR REPLACE FUNCTION ezlogs.drop_orphan_captures() RETURNS void
+  LANGUAGE plpgsql
+  SECURITY DEFINER
+  SET search_path = ezlogs, pg_temp
+AS $$
+DECLARE
+  f regprocedure;
+BEGIN
+  -- Only functions no trigger uses (whatever table or oid their name mentions: a restore can
+  -- change oids), each on its own: one that can't be dropped never stops the others or the job.
+  FOR f IN SELECT p.oid::regprocedure FROM pg_proc p
+            WHERE p.pronamespace = 'ezlogs'::regnamespace AND p.proname ~ '^cap_[0-9]+_(ins|upd|del)'
+              AND NOT EXISTS (SELECT 1 FROM pg_trigger t WHERE t.tgfoid = p.oid)
+            LIMIT 100 LOOP
+    BEGIN
+      EXECUTE format('DROP FUNCTION IF EXISTS %s', f);
+    EXCEPTION WHEN others THEN
+      RAISE WARNING '[ezlogs] could not remove % (retried later): %', f, SQLERRM;
+    END;
+  END LOOP;
+END;
+$$;
+
 CREATE OR REPLACE FUNCTION ezlogs.reconcile() RETURNS int
   LANGUAGE plpgsql
   SECURITY DEFINER
   SET search_path = ezlogs, pg_temp
 AS $$
 DECLARE
-  t regclass;
-  n int := 0;
+  t       regclass;
+  n       int := 0;
+  pending boolean := false;
+  prev_timeout text := current_setting('lock_timeout');
 BEGIN
   IF NOT ezlogs.connected() THEN
     RETURN 0;
   END IF;
   PERFORM ezlogs.attach_platform();
+  -- At most 10 tables (re)attached per run, each holding its lock only until this run commits,
+  -- so an install or an upgrade on a large schema never blocks the app's writes for long; the
+  -- rest wait for the next run (5 seconds later).
   FOR t IN SELECT c.oid::regclass FROM pg_class c
             WHERE c.relnamespace = 'public'::regnamespace AND c.relkind IN ('r', 'p') AND NOT c.relispartition
+            ORDER BY c.oid
   LOOP
+    IF n >= 10 THEN
+      pending := true;
+      EXIT;
+    END IF;
     BEGIN
-      IF ezlogs.attach(t) THEN n := n + 1; END IF;
+      IF ezlogs.attach_needed(t) AND ezlogs.attach(t) THEN n := n + 1; END IF;
     EXCEPTION WHEN others THEN
       RAISE WARNING '[ezlogs] could not track % now (retried later): %', t, SQLERRM;
     END;
   END LOOP;
-  UPDATE ezlogs.state SET last_reconciled = now() WHERE one;
+  -- A table attached as a partition after it was tracked on its own: its parent's trigger covers it.
+  -- Dropping a trigger locks the table: wait at most 100 ms, else next run.
+  PERFORM set_config('lock_timeout', '100ms', true);
+  FOR t IN SELECT DISTINCT tg.tgrelid::regclass FROM pg_trigger tg JOIN pg_class c ON c.oid = tg.tgrelid
+            WHERE c.relispartition AND tg.tgname LIKE 'ezlogs\_capture%' AND tg.tgparentid = 0 LIMIT 10 LOOP
+    BEGIN
+      PERFORM ezlogs.detach(t);
+    EXCEPTION WHEN others THEN
+      RAISE WARNING '[ezlogs] could not update % now (retried later): %', t, SQLERRM;
+    END;
+  END LOOP;
+  PERFORM set_config('lock_timeout', prev_timeout, true);
+  -- Capture functions left by dropped tables (their triggers went with the table).
+  PERFORM ezlogs.drop_orphan_captures();
+  -- The outbox's cap: 5% of the database, between 10 MB (so a small app rides out a short outage)
+  -- and 50 MB.
+  UPDATE ezlogs.state
+     SET last_reconciled = CASE WHEN pending THEN NULL ELSE now() END,
+         outbox_cap_bytes = greatest(10485760, least(52428800, pg_database_size(current_database()) / 20))
+   WHERE one;
   RETURN n;
+END;
+$$;
+
+-- Whether a table's triggers are missing or out of date (a cheap catalog check, before attach
+-- builds anything): no EZLogs trigger yet, or ones made by an older version.
+CREATE OR REPLACE FUNCTION ezlogs.attach_needed(target regclass) RETURNS boolean
+  LANGUAGE sql STABLE
+  SET search_path = ezlogs, pg_temp
+AS $$
+  SELECT NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgrelid = target AND tgname LIKE 'ezlogs\_capture%')
+      OR EXISTS (SELECT 1 FROM pg_trigger WHERE tgrelid = target AND tgname LIKE 'ezlogs\_capture%'
+                  AND position(convert_to(ezlogs.table_signature(target), 'UTF8') in tgargs) = 0)
+$$;
+
+-- Attach (or refresh) every table: through the flush job when pg_cron is there (10 tables per run,
+-- never a long lock), else here and now.
+CREATE OR REPLACE FUNCTION ezlogs.queue_reconcile() RETURNS void
+  LANGUAGE plpgsql
+  SECURITY DEFINER
+  SET search_path = ezlogs, pg_temp
+AS $$
+DECLARE
+  i int;
+BEGIN
+  IF NOT ezlogs.connected() THEN
+    RETURN;
+  END IF;
+  UPDATE ezlogs.state SET last_reconciled = NULL WHERE one;
+  IF to_regclass('cron.job') IS NOT NULL THEN
+    PERFORM ezlogs.ensure_flush_job();
+  ELSE
+    FOR i IN 1..1000 LOOP
+      PERFORM ezlogs.reconcile();
+      EXIT WHEN (SELECT last_reconciled IS NOT NULL FROM ezlogs.state WHERE one);
+    END LOOP;
+  END IF;
 END;
 $$;
 
@@ -817,6 +1473,7 @@ AS $$
     'old', o.old_row, 'new', o.new_row, 'resource_id', o.resource_id,
     'claims', o.claims, 'correlation_id', o.correlation_id, 'txid', o.txid,
     'tx_started_at', o.tx_started_at, 'captured_at', o.captured_at)
+    || CASE WHEN o.row_count IS NOT NULL THEN jsonb_build_object('row_count', o.row_count, 'bulk', o.bulk) ELSE '{}'::jsonb END
 $$;
 
 CREATE OR REPLACE FUNCTION ezlogs.send_batch() RETURNS int
@@ -869,6 +1526,10 @@ BEGIN
            'supabase_url', st.supabase_url,
            'dropped_rows', st.dropped_total,
            'names',        names,
+           -- About how many wait (ids run in order; read from the unsent index, never counted).
+           'waiting_rows', (SELECT COALESCE(max(id) - min(id) + 1, 0) FROM ezlogs.outbox WHERE request_id IS NULL),
+           'capture_paused', CASE WHEN st.capture_paused_at IS NOT NULL
+                                  THEN jsonb_build_object('since', st.capture_paused_at, 'reason', st.capture_paused_reason) END,
            'rows', jsonb_agg(ezlogs.row_json(o) ORDER BY o.id))
     INTO payload
     FROM ezlogs.outbox o WHERE o.id = ANY(ids);
@@ -895,9 +1556,7 @@ CREATE OR REPLACE FUNCTION ezlogs.ensure_flush_job() RETURNS void
   SET search_path = ezlogs, pg_temp
 AS $$
 BEGIN
-  IF to_regclass('cron.job') IS NULL OR EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'ezlogs-flush')
-     -- Paused for something only a person can fix: the next write after the pause wakes it.
-     OR EXISTS (SELECT 1 FROM ezlogs.state WHERE one AND paused_until > clock_timestamp() + interval '10 minutes') THEN
+  IF to_regclass('cron.job') IS NULL OR EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'ezlogs-flush') THEN
     RETURN;
   END IF;
   PERFORM cron.schedule('ezlogs-flush', '5 seconds', 'SELECT ezlogs.flush()');
@@ -923,6 +1582,7 @@ BEGIN
     RETURN NULL;
   END IF;
   PERFORM set_config('ezlogs.shipped_tx', txid_current()::text, true);
+  DELETE FROM ezlogs.tx_marks WHERE txid = txid_current();
   -- A SERIALIZABLE transaction would take on our reads as conflicts: leave its rows to the
   -- next writer or the flush job.
   IF current_setting('transaction_isolation') = 'serializable' THEN
@@ -931,6 +1591,10 @@ BEGIN
   SELECT * INTO st FROM ezlogs.state WHERE one FOR UPDATE SKIP LOCKED;
   IF NOT FOUND OR st.connected_at IS NULL THEN
     RETURN NULL;
+  END IF;
+  -- A capture failed in this transaction: re-attach tables on the next flush run.
+  IF current_setting('ezlogs.capture_failed', true) = '1' AND st.last_reconciled IS NOT NULL THEN
+    UPDATE ezlogs.state SET last_reconciled = NULL WHERE one;
   END IF;
   IF st.last_sent_at IS NULL OR st.last_sent_at < clock_timestamp() - interval '1 second' THEN
     PERFORM ezlogs.send_batch();
@@ -948,11 +1612,24 @@ END;
 $$;
 
 DO $$
+DECLARE
+  prev text := current_setting('lock_timeout');
 BEGIN
-  -- Recreating it would lock the outbox (and every tracked write) during an upgrade.
-  IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'ezlogs_ship_at_commit' AND tgrelid = 'ezlogs.outbox'::regclass) THEN
-    CREATE CONSTRAINT TRIGGER ezlogs_ship_at_commit AFTER INSERT ON ezlogs.outbox
+  -- 1.5.0 ships once per transaction from ezlogs.tx_marks (one deferred event per transaction,
+  -- not one per captured row). The 1.4.0 trigger on the outbox is removed if the outbox can be
+  -- locked for a moment; if not, it stays harmlessly (shipping already runs once per transaction).
+  IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'ezlogs_ship_at_commit' AND tgrelid = 'ezlogs.tx_marks'::regclass) THEN
+    CREATE CONSTRAINT TRIGGER ezlogs_ship_at_commit AFTER INSERT ON ezlogs.tx_marks
       DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION ezlogs.ship_at_commit();
+  END IF;
+  IF EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'ezlogs_ship_at_commit' AND tgrelid = 'ezlogs.outbox'::regclass) THEN
+    BEGIN
+      PERFORM set_config('lock_timeout', '500ms', true);
+      DROP TRIGGER ezlogs_ship_at_commit ON ezlogs.outbox;
+    EXCEPTION WHEN lock_not_available THEN
+      RAISE NOTICE '[ezlogs] the outbox was busy: its 1.4.0 trigger stays until the next upgrade';
+    END;
+    PERFORM set_config('lock_timeout', prev, true);
   END IF;
 END $$;
 
@@ -970,6 +1647,10 @@ DECLARE
   resp    record;
   dropped bigint;
   i       int;
+  waiting_bytes numeric;
+  probe_status  int;
+  probe_key     text;
+  posts         int;
 BEGIN
   SELECT * INTO st FROM ezlogs.state WHERE one FOR UPDATE;
 
@@ -989,7 +1670,8 @@ BEGIN
   LOOP
     IF resp.status_code BETWEEN 200 AND 299 THEN
       DELETE FROM ezlogs.outbox WHERE request_id = resp.id AND sent_at <= resp.created;
-      UPDATE ezlogs.state SET last_status = resp.status_code, last_error = NULL, failures = 0, paused_until = NULL
+      UPDATE ezlogs.state SET last_status = resp.status_code, last_error = NULL, failures = 0, paused_until = NULL,
+                              blocked_since = NULL
        WHERE one;
     ELSIF resp.status_code IN (400, 413, 422) THEN
       -- Refused for good: retrying the same rows would block everything behind them.
@@ -1009,6 +1691,8 @@ BEGIN
              last_error  = left(COALESCE(resp.error_msg, CASE WHEN resp.timed_out THEN 'timed out' END,
                                          'HTTP ' || resp.status_code), 300),
              failures    = failures + 1,
+             blocked_since = CASE WHEN resp.status_code IN (401, 402, 403, 423) THEN COALESCE(blocked_since, clock_timestamp())
+                                  ELSE blocked_since END,
              -- Key revoked / account stopped: an hour. Rate limited: 5 minutes.
              -- Anything else: back off 2^failures seconds, at most 10 minutes.
              paused_until = clock_timestamp() + CASE
@@ -1043,10 +1727,82 @@ BEGIN
     UPDATE ezlogs.state SET dropped_total = dropped_total + dropped WHERE one;
   END IF;
 
-  -- 4. Every 10 minutes: new or changed tables (when the host has no event trigger), and the
-  --    job's own run history (it would grow by 17,000 rows a day while the job runs).
+  -- 3b. Never fill the database (1.5.0). The waiting rows' size, estimated from the newest 100
+  --     rows (index reads, constant time), against the cap measured at reconcile. Past it, or after
+  --     an hour of refusals only a person can fix, capture pauses (rows are skipped, not queued);
+  --     it resumes once the outbox is under half the cap, or once EZLogs accepts again.
+  SELECT * INTO st FROM ezlogs.state WHERE one;
+  SELECT COALESCE((SELECT max(id) - min(id) + 1 FROM ezlogs.outbox), 0)
+         * COALESCE((SELECT avg(pg_column_size(o.*)) FROM (SELECT * FROM ezlogs.outbox ORDER BY id DESC LIMIT 100) o), 0)
+    INTO waiting_bytes;
+  IF st.capture_paused_at IS NULL THEN
+    IF waiting_bytes > COALESCE(st.outbox_cap_bytes, 52428800) THEN
+      UPDATE ezlogs.state SET capture_paused_at = clock_timestamp(),
+                              capture_paused_reason = 'the outbox reached its size limit (EZLogs could not keep up)'
+       WHERE one;
+    ELSIF st.blocked_since < clock_timestamp() - interval '1 hour' THEN
+      UPDATE ezlogs.state SET capture_paused_at = clock_timestamp(),
+                              capture_paused_reason = 'EZLogs refused for an hour: ' || COALESCE(st.last_error, 'HTTP ' || st.last_status),
+                              hello_request_id = NULL -- an older hello's answer must not end this pause
+       WHERE one;
+    END IF;
+  ELSIF st.capture_paused_reason LIKE 'the outbox%' AND waiting_bytes < COALESCE(st.outbox_cap_bytes, 52428800) / 2 THEN
+    UPDATE ezlogs.state SET capture_paused_at = NULL, capture_paused_reason = NULL WHERE one;
+  ELSIF st.capture_paused_reason LIKE 'EZLogs refused%' AND st.blocked_since IS NULL THEN
+    UPDATE ezlogs.state SET capture_paused_at = NULL, capture_paused_reason = NULL WHERE one;
+  ELSIF st.capture_paused_reason LIKE 'EZLogs refused%' THEN
+    -- Paused by refusals: ask again with an empty post (as connect does), at most once an hour;
+    -- an accepting answer resumes capture.
+    IF st.hello_request_id IS NOT NULL THEN
+      EXECUTE 'SELECT status_code FROM net._http_response WHERE id = $1' INTO probe_status USING st.hello_request_id;
+    END IF;
+    IF probe_status BETWEEN 200 AND 299 THEN
+      UPDATE ezlogs.state SET blocked_since = NULL, capture_paused_at = NULL, capture_paused_reason = NULL,
+                              paused_until = NULL, failures = 0, last_status = probe_status, last_error = NULL, hello_request_id = NULL
+       WHERE one;
+    ELSIF st.paused_until IS NULL OR st.paused_until <= clock_timestamp() THEN
+      SELECT decrypted_secret INTO probe_key FROM vault.decrypted_secrets WHERE name = 'ezlogs_ingest_key' LIMIT 1;
+      IF probe_key IS NOT NULL THEN
+        UPDATE ezlogs.state s
+           SET paused_until = clock_timestamp() + interval '1 hour',
+               hello_request_id = net.http_post(
+                 url                  := ezlogs.endpoint(),
+                 body                 := jsonb_build_object('install_id', s.install_id, 'version', ezlogs.version(),
+                                                            'supabase_url', s.supabase_url, 'dropped_rows', s.dropped_total,
+                                                            'capture_paused', jsonb_build_object('since', s.capture_paused_at, 'reason', s.capture_paused_reason),
+                                                            'rows', '[]'::jsonb),
+                 headers              := jsonb_build_object('Authorization', 'Bearer ' || probe_key, 'Content-Type', 'application/json'),
+                 timeout_milliseconds := 10000)
+         WHERE one;
+      END IF;
+    END IF;
+  END IF;
+  DELETE FROM ezlogs.tx_marks WHERE marked_at < clock_timestamp() - interval '1 minute';
+
+  -- 4. Send what waits: more posts in flight the longer the backlog (10 to 25 posts of at most
+  --    48 KB every 5 seconds, about 45,000 rows a minute), so an outage's backlog drains in
+  --    minutes, and stays under EZLogs' limit of 600 posts a minute per key. Its own block: a
+  --    failure here never undoes the confirmations and bounds above.
+  BEGIN
+    SELECT CASE WHEN w > 20000 THEN 25 WHEN w > 2000 THEN 15 ELSE 10 END INTO posts
+      FROM (SELECT COALESCE(max(id) - min(id) + 1, 0) AS w FROM ezlogs.outbox WHERE request_id IS NULL) b;
+    FOR i IN 1..posts LOOP
+      EXIT WHEN ezlogs.send_batch() = 0;
+    END LOOP;
+  EXCEPTION WHEN others THEN
+    RAISE WARNING '[ezlogs] sending failed (retried next run): %', SQLERRM;
+  END;
+
+  -- 5. Every 10 minutes (and while tables wait to be attached): new or changed tables, and the
+  --    job's own run history (it would grow by 17,000 rows a day while the job runs). Last, so
+  --    the table locks attaching takes are held only until this run commits, a moment later; its
+  --    own block, so a failure never undoes the steps above.
   IF st.last_reconciled IS NULL OR st.last_reconciled < clock_timestamp() - interval '10 minutes' THEN
-    PERFORM ezlogs.reconcile();
+    BEGIN
+      PERFORM ezlogs.reconcile();
+    EXCEPTION WHEN others THEN
+      RAISE WARNING '[ezlogs] attaching tables failed (retried next run): %', SQLERRM;
+    END;
     BEGIN
       DELETE FROM cron.job_run_details
        WHERE jobid IN (SELECT jobid FROM cron.job WHERE jobname = 'ezlogs-flush')
@@ -1056,17 +1812,15 @@ BEGIN
     END;
   END IF;
 
-  -- 5. Send what waits: up to 10 small posts this run (about 1,000 rows every 5 seconds).
-  FOR i IN 1..10 LOOP
-    EXIT WHEN ezlogs.send_batch() = 0;
-  END LOOP;
-
   -- 6. Remove the job when nothing waits, when not connected, or when paused for a person.
   --    (A write that commits right after this check waits for the next write to ship.)
   SELECT * INTO st FROM ezlogs.state WHERE one;
-  IF NOT EXISTS (SELECT 1 FROM ezlogs.outbox)
-     OR st.connected_at IS NULL
-     OR st.paused_until > clock_timestamp() + interval '10 minutes' THEN
+  -- Never before every table is attached. While EZLogs refuses, an idle project keeps no job: the
+  -- app's next write brings it back (captures mark their transaction even while paused), and
+  -- that run checks the cap and asks EZLogs again once the hour is over.
+  IF st.last_reconciled IS NOT NULL
+     AND (st.connected_at IS NULL OR NOT EXISTS (SELECT 1 FROM ezlogs.outbox)
+          OR (st.blocked_since IS NOT NULL AND st.paused_until > clock_timestamp())) THEN
     PERFORM cron.unschedule('ezlogs-flush');
   END IF;
 EXCEPTION WHEN others THEN
@@ -1114,15 +1868,14 @@ BEGIN
   END IF;
 
   UPDATE ezlogs.state
-     SET supabase_url = COALESCE(url, supabase_url), connected_at = now(), paused_until = NULL, failures = 0, last_error = NULL
+     SET supabase_url = COALESCE(url, supabase_url), connected_at = now(), paused_until = NULL, failures = 0, last_error = NULL,
+         blocked_since = NULL,
+         capture_paused_at     = CASE WHEN capture_paused_reason LIKE 'EZLogs refused%' THEN NULL ELSE capture_paused_at END,
+         capture_paused_reason = CASE WHEN capture_paused_reason LIKE 'EZLogs refused%' THEN NULL ELSE capture_paused_reason END
    WHERE one;
 
   PERFORM ezlogs.attach_platform();
-
-  PERFORM ezlogs.reconcile();
-  IF EXISTS (SELECT 1 FROM ezlogs.outbox) THEN
-    PERFORM ezlogs.ensure_flush_job();
-  END IF;
+  PERFORM ezlogs.queue_reconcile();
 
   -- Say hello: an empty post, so EZLogs shows this database as connected before the app writes.
   UPDATE ezlogs.state s
@@ -1137,8 +1890,10 @@ BEGIN
 
   RETURN format('Connected (EZLogs %s). Now recording changes to %s tables, sign-ups, sign-ins and files.',
                 ezlogs.version(),
-                (SELECT count(*) FROM pg_trigger WHERE tgname = 'ezlogs_capture' AND NOT tgisinternal
-                   AND tgrelid IN (SELECT oid FROM pg_class WHERE relnamespace = 'public'::regnamespace)));
+                (SELECT count(*) FROM pg_class c
+                  WHERE c.relnamespace = 'public'::regnamespace AND c.relkind IN ('r', 'p') AND NOT c.relispartition
+                    AND NOT ezlogs.skipped(c.relname)
+                    AND NOT EXISTS (SELECT 1 FROM ezlogs.excluded e WHERE e.table_oid = c.oid)));
 END;
 $$;
 
@@ -1164,12 +1919,15 @@ BEGIN
     'version',        ezlogs.version(),
     'connected',      s.connected_at IS NOT NULL,
     'supabase_url',   s.supabase_url,
-    'waiting_rows',   (SELECT count(*) FROM ezlogs.outbox),
-    'tracked_tables', (SELECT count(*) FROM pg_trigger WHERE tgname = 'ezlogs_capture' AND NOT tgisinternal),
+    'waiting_rows',   (SELECT COALESCE(max(id) - min(id) + 1, 0) FROM ezlogs.outbox),
+    'tracked_tables', (SELECT count(DISTINCT tgrelid) FROM pg_trigger WHERE tgname LIKE 'ezlogs\_capture%' AND NOT tgisinternal AND tgparentid = 0),
     'last_sent_at',   s.last_sent_at,
     'last_status',    s.last_status,
     'last_error',     s.last_error,
     'paused_until',   s.paused_until,
+    'capture_paused', CASE WHEN s.capture_paused_at IS NOT NULL
+                           THEN jsonb_build_object('since', s.capture_paused_at, 'reason', s.capture_paused_reason) END,
+    'outbox_cap_bytes', s.outbox_cap_bytes,
     'dropped_total',  s.dropped_total,
     'flush_job',      CASE WHEN to_regclass('cron.job') IS NULL THEN 'pg_cron not installed' END,
     'hello',          hello,
@@ -1185,8 +1943,9 @@ AS $$
 DECLARE
   r record;
 BEGIN
-  FOR r IN SELECT tgrelid::regclass AS rel FROM pg_trigger WHERE tgname = 'ezlogs_capture' AND NOT tgisinternal LOOP
-    EXECUTE format('DROP TRIGGER IF EXISTS ezlogs_capture ON %s', r.rel);
+  FOR r IN SELECT DISTINCT tgrelid::regclass AS rel FROM pg_trigger
+            WHERE tgname LIKE 'ezlogs\_capture%' AND NOT tgisinternal AND tgparentid = 0 LOOP   -- clones go with their parent
+    PERFORM ezlogs.detach(r.rel);
   END LOOP;
   DROP EVENT TRIGGER IF EXISTS ezlogs_track_tables;
   IF to_regclass('cron.job') IS NOT NULL AND EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'ezlogs-flush') THEN
@@ -1218,7 +1977,22 @@ BEGIN
   END LOOP;
 END $$;
 
--- Already connected (re-applying the migration to upgrade): refresh the triggers now.
-SELECT ezlogs.reconcile();
+-- Already connected (re-applying the migration to upgrade): Supabase's own tables a newer version
+-- reads are added now; the flush job refreshes the app tables' triggers, a few per run, so the
+-- upgrade itself never holds a lock on the app's tables.
+-- Upgrading from 1.4.0, which kept no list: a table whose name EZLogs skips but that has capture
+-- triggers was tracked by a person (ezlogs.track). Remember it, so it keeps being recorded.
+INSERT INTO ezlogs.tracked (table_oid)
+SELECT DISTINCT t.tgrelid FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid
+ WHERE c.relnamespace = 'public'::regnamespace AND ezlogs.skipped(c.relname)
+   AND t.tgname = 'ezlogs_capture' AND t.tgnargs = 6   -- 1.4.0's own trigger (1.5.0's carry a signature too)
+   -- never a table named like a secret: 1.4.0 kept recording a table renamed to such a name, which
+   -- is no sign a person chose it (hide more when unsure; ezlogs.track records it again)
+   AND NOT ezlogs.is_sensitive_key(c.relname)
+   AND NOT t.tgisinternal AND t.tgparentid = 0
+ON CONFLICT DO NOTHING;
+
+SELECT ezlogs.attach_platform() WHERE ezlogs.connected();
+SELECT ezlogs.queue_reconcile();
 
 RESET check_function_bodies;
