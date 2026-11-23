@@ -216,7 +216,7 @@ CREATE TABLE IF NOT EXISTS ezlogs.tx_marks (
 -- Constants
 -- ---------------------------------------------------------------------------------------
 
-CREATE OR REPLACE FUNCTION ezlogs.version() RETURNS text LANGUAGE sql IMMUTABLE AS $$ SELECT '1.5.1' $$;
+CREATE OR REPLACE FUNCTION ezlogs.version() RETURNS text LANGUAGE sql IMMUTABLE AS $$ SELECT '1.5.2' $$;
 
 -- Where data goes. A constant, never a setting: nothing inside the database can point the
 -- capture at another host.
@@ -350,7 +350,8 @@ $$;
 -- Who made this write, from what Supabase verified (PostgREST and storage set
 -- request.jwt.claims per request after checking the JWT): role, user id, email, name, the
 -- OAuth client (an AI connected through Supabase's OAuth server), the issuer, anonymous or not. Auth's own
--- writes (sign-up, sign-in) carry none. Parsed once per transaction.
+-- writes (sign-up, sign-in) carry none. A write with neither, made by a pg_cron job (its sessions are
+-- named 'pg_cron'), says so: {"scheduler": "pg_cron"} (1.5.2). Parsed once per transaction.
 CREATE OR REPLACE FUNCTION ezlogs.request_claims() RETURNS jsonb
   LANGUAGE plpgsql VOLATILE
   SET search_path = ezlogs, pg_temp
@@ -358,7 +359,8 @@ AS $$
 DECLARE
   raw    text := current_setting('request.jwt.claims', true);
   aid    text := NULLIF(current_setting('ezlogs.actor_id', true), '');
-  src    text := COALESCE(raw, '') || '|' || COALESCE(aid, '');
+  app    text := current_setting('application_name', true);
+  src    text := COALESCE(raw, '') || '|' || COALESCE(aid, '') || '|' || COALESCE(app, '');
   c      jsonb;
   result jsonb;
 BEGIN
@@ -390,6 +392,8 @@ BEGIN
       'iss',          left(c->>'iss', 200),
       'is_anonymous', CASE WHEN jsonb_typeof(c->'is_anonymous') = 'boolean' THEN c->'is_anonymous' END
     )), '{}'::jsonb);
+  ELSIF app = 'pg_cron' THEN
+    result := jsonb_build_object('scheduler', 'pg_cron');
   END IF;
   PERFORM set_config('ezlogs.claims', COALESCE(result::text, ''), true);
   PERFORM set_config('ezlogs.claims_src', src, true);

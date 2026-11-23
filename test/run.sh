@@ -154,7 +154,7 @@ expect "an upload names the file and its owner" "
 o=[r for r in rows if r['schema']=='storage' and r['op']=='INSERT'][0]['new']
 assert o['bucket_id']=='files' and o['name'].startswith('$USER_ID/brief-') and o['owner_id']=='$USER_ID' and o['mimetype']=='text/plain', o"
 expect "every post names the install and the version" "
-assert all(p['version']=='1.5.1' and p['install_id'] and p['supabase_url']=='https://local-test.supabase.co' for p in posts)"
+assert all(p['version']=='1.5.2' and p['install_id'] and p['supabase_url']=='https://local-test.supabase.co' for p in posts)"
 check "the key travels only in the Authorization header" python3 -I -c "
 import json
 for l in open('$LOG'):
@@ -168,6 +168,20 @@ f=[r for r in rows if r['table']=='feedback'][0]; assert f['claims']['role']=='a
 expect "a service-role write is marked service_role" "
 s=[r for r in rows if r['table']=='items' and (r.get('new') or {}).get('name','').startswith('server-')][0]
 assert s['claims']['role']=='service_role', s['claims']"
+
+echo "== a pg_cron job's write says so; a write from psql says nothing"
+q "insert into public.items(name) values ('from-psql')" >/dev/null
+q "select cron.schedule('ezlogs-test-cron', '1 seconds', \$\$insert into public.items(name) select 'from-cron' where not exists (select 1 from public.items where name = 'from-cron')\$\$)" >/dev/null
+cron_rows() { q "select count(*) from public.items where name = 'from-cron'"; }
+wait_until "[ \"\$(cron_rows)\" = 1 ]" 20
+q "select cron.unschedule('ezlogs-test-cron')" >/dev/null
+wait_until "grep -q from-cron '$LOG' && [ \"\$(outbox)\" = 0 ]" 60
+expect "a pg_cron job's write is marked scheduler pg_cron, and only that" "
+c=[r for r in rows if (r.get('new') or {}).get('name')=='from-cron'][0]
+assert c['claims']=={'scheduler': 'pg_cron'}, c['claims']
+p=[r for r in rows if (r.get('new') or {}).get('name')=='from-psql'][0]
+assert p.get('claims') is None, p['claims']"
+check "the test job is gone" test "$(q "select count(*) from cron.job where jobname = 'ezlogs-test-cron'")" = 0
 
 echo "== what never leaves the database"
 q "insert into public.items(name, pairs, settings, notes) values ('json-secrets', ARRAY['{\"k\":\"v\",\"api_token\":\"t\"}'::jsonb], '{\"theme\":\"dark\",\"stripe_secret_key\":\"sk_live_x\",\"profile\":{\"password\":\"hunter2\",\"city\":\"Cluj\"}}', repeat('x', 50000))" >/dev/null
@@ -670,8 +684,8 @@ wait_until "[ \"\$(outbox)\" = 0 ]" 30
 check "an upgrade sends the sessions still valid again (EZLogs keeps one per id)" test "$(outbox)" = 0
 
 echo "== status and uninstall"
-check "connect says which version is running" bash -c "psql '$DB' -X -At -c \"select ezlogs.connect('$KEY')\" | grep -q '^Connected (EZLogs 1.5.1)\. Now recording changes to '"
-check "status reports the connection" python3 -I -c "import json,sys; s=json.loads(sys.argv[1]); assert s['connected'] and s['version']=='1.5.1' and s['waiting_rows']==0 and s['dropped_total']>=1, s" "$(q 'select ezlogs.status()')"
+check "connect says which version is running" bash -c "psql '$DB' -X -At -c \"select ezlogs.connect('$KEY')\" | grep -q '^Connected (EZLogs 1.5.2)\. Now recording changes to '"
+check "status reports the connection" python3 -I -c "import json,sys; s=json.loads(sys.argv[1]); assert s['connected'] and s['version']=='1.5.2' and s['waiting_rows']==0 and s['dropped_total']>=1, s" "$(q 'select ezlogs.status()')"
 check "the table created before connect is tracked since" test "$(tracked public.pre_connect)" = 1
 check "uninstall" q "select ezlogs.uninstall()"
 check "no triggers, no schema, no key, no job are left" test "$(q "select (select count(*) from pg_trigger where tgname like 'ezlogs\_capture%') + (select count(*) from pg_namespace where nspname='ezlogs') + (select count(*) from vault.secrets where name='ezlogs_ingest_key') + (select count(*) from cron.job where jobname='ezlogs-flush') + (select count(*) from pg_event_trigger where evtname='ezlogs_track_tables')")" = 0

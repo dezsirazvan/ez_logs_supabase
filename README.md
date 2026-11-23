@@ -51,7 +51,8 @@ Lovable Cloud project, and the install enables them. Nothing is recorded until `
 
 **Who did it** comes from the login Supabase already verified for the request. That is a
 signed-in user, an anonymous visitor, your server using the service key, or an AI connected
-through Supabase's OAuth server. Each row also carries your project's auth address (the
+through Supabase's OAuth server. A change a pg_cron job makes reads as "Scheduled job" (1.5.2).
+Each row also carries your project's auth address (the
 token's `iss`), so EZLogs can check logins reported by the browser against your project only.
 
 **Columns named like secrets** (password, token, secret, api_key, card number, cvv, pin, otp, …)
@@ -146,7 +147,8 @@ END $$;
 
 `test/run.sh` runs the install against a local Supabase stack (Docker and the supabase CLI). It
 drives real sign-ups, uploads, refused writes, outages, a revoked key, bursts, concurrent writers
-and an uninstall: `cd test && npm install && bash run.sh`.
+and an uninstall: `cd test && npm install && bash run.sh`. `bash upgrade.sh` upgrades each earlier
+release, holding rows it could not send yet, and checks every row arrives exactly once (monorepo checkout only).
 
 `test/load.sh` measures what capture adds to an app's writes. With 100,000 rows on a laptop
 (1.5.0, against 1.4.0): an insert +0.02 s (was +4.2 s), an update of every row +0.02 s (was

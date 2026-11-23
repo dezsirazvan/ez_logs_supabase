@@ -1,0 +1,6 @@
+{
+  "imports": {
+    "@ezlogs/server": "./vendor/index.js",
+    "async_hooks": "node:async_hooks"
+  }
+}
