@@ -93,7 +93,12 @@ and an update that changed only them is not recorded.
 - It records once per statement, not once per row: a table with a one-column primary key gets
   three statement triggers (insert, update, delete) and capture functions made for that table.
   An import of 100,000 rows adds milliseconds, not seconds. A table without a one-column key, and
-  a partitioned table (so writes made straight to a partition are seen), keep one trigger per row.
+  a partitioned table (so writes made straight to a partition are seen), and a table with
+  old-style INHERITS parents or children (so a write through the parent records each row once,
+  under its own table) keep one trigger per row. A child table that is excluded, skipped by name
+  or outside `public` is not recorded through its INHERITS parent either.
+- A database that never ran `ezlogs.connect()` (a branch, a preview, a `db reset`) records
+  nothing, so nothing waits there for a connection that never comes.
 - A statement over 100 rows keeps its rows in Postgres's temporary files until it ends (the price
   of recording it once): a mass update of a large table needs temporary disk about the size of
   the rows it changes, twice.

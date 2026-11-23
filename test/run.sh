@@ -62,7 +62,7 @@ assert a and a == b, (a, b)"
 echo "== setup: a small app (tables, RLS, a storage bucket)"
 q "select ezlogs.uninstall()" >/dev/null 2>&1
 psql "$DB" -X -q -v ON_ERROR_STOP=1 <<'SQL' || { echo "app setup failed"; exit 1; }
-DROP TABLE IF EXISTS public.items, public.feedback, public.later_table, public.pre_connect, public.api_tokens, public.wide, public.invoices, public.bills, public."order-items", public.docs15, public.bulk15, public.pairs15, public.vars15, public.keys15, public.orders15, public.purchases15, public.emb15, public.part15, public.pairs16, public.boxes, public.huge15, public.orphan15, public.schema_migrations_x, public.ar_internal_metadata, public.alias15, public.defer15, public.vc15, public.solo15, public.parent15, public.plain15, public.app_secrets15, public.stale15, public.big15, public.types15 CASCADE;
+DROP TABLE IF EXISTS public.items, public.feedback, public.later_table, public.pre_connect, public.api_tokens, public.wide, public.invoices, public.bills, public."order-items", public.docs15, public.bulk15, public.pairs15, public.vars15, public.keys15, public.orders15, public.purchases15, public.emb15, public.part15, public.pairs16, public.boxes, public.huge15, public.orphan15, public.schema_migrations_x, public.ar_internal_metadata, public.alias15, public.defer15, public.vc15, public.solo15, public.parent15, public.plain15, public.app_secrets15, public.stale15, public.big15, public.types15, public.ren16, public.inh16_child, public.inh16, public.inh17_child, public.inh17 CASCADE;
 CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA extensions;
 CREATE TABLE public.items (id bigserial PRIMARY KEY, name text UNIQUE NOT NULL, secret_token text,
                            settings jsonb, notes text, pairs jsonb[], created_by uuid DEFAULT auth.uid());
@@ -88,6 +88,10 @@ q "delete from auth.sessions where id = '00000000-0000-0000-0000-00000000005e'; 
    insert into auth.users (id, aud, role, email) values ('00000000-0000-0000-0000-0000000000ee', 'authenticated', 'authenticated', 'pre@example.com');
    insert into auth.sessions (id, user_id, created_at) values ('00000000-0000-0000-0000-00000000005e', '00000000-0000-0000-0000-0000000000ee', now())" >/dev/null
 check "nothing is recorded before connect" test "$(q "select (select count(*) from ezlogs.outbox) + (select count(*) from pg_trigger where tgname like 'ezlogs\_capture%')")" = 0
+# 1.5.3: a branch or preview that runs install.sql (and name_records) but never connects records nothing.
+q "select ezlogs.name_records('public.pre_connect', NULL)" >/dev/null
+q "insert into public.pre_connect(label) values ('never connected'); update public.pre_connect set label = 'still never connected'" >/dev/null
+check "a table named before connect still records nothing until connect (no outbox that never ships)" test "$(q "select (select count(*) from ezlogs.outbox) + (select count(*) from ezlogs.tx_marks)")" = 0
 q "CREATE OR REPLACE FUNCTION ezlogs.endpoint() RETURNS text LANGUAGE sql IMMUTABLE AS \$\$ SELECT '$ENDPOINT' \$\$" >/dev/null
 check "a bad key is refused with a clear message" bash -c "! psql '$DB' -X -At -c \"select ezlogs.connect('ezl_wrongkind', 'https://abc.supabase.co')\" 2>/dev/null"
 check "a full API key in the SQL editor is told where the database key is" bash -c "psql '$DB' -X -At -c \"select ezlogs.connect('ezl_wrongkind', 'https://abc.supabase.co')\" 2>&1 | grep -q 'Settings, API keys, the Lovable · Bolt · v0 tab'"
@@ -154,7 +158,7 @@ expect "an upload names the file and its owner" "
 o=[r for r in rows if r['schema']=='storage' and r['op']=='INSERT'][0]['new']
 assert o['bucket_id']=='files' and o['name'].startswith('$USER_ID/brief-') and o['owner_id']=='$USER_ID' and o['mimetype']=='text/plain', o"
 expect "every post names the install and the version" "
-assert all(p['version']=='1.5.2' and p['install_id'] and p['supabase_url']=='https://local-test.supabase.co' for p in posts)"
+assert all(p['version']=='1.5.3' and p['install_id'] and p['supabase_url']=='https://local-test.supabase.co' for p in posts)"
 check "the key travels only in the Authorization header" python3 -I -c "
 import json
 for l in open('$LOG'):
@@ -546,6 +550,40 @@ q "insert into public.items(name) values ('after-resume')" >/dev/null
 wait_until "[ \"\$(outbox)\" = 0 ]" 20
 expect "writes are recorded again after it resumes" "assert any((r.get('new') or {}).get('name')=='after-resume' for r in rows)"
 
+echo "== 1.5.3: a renamed column, and an old-style INHERITS table"
+q "create table public.ren16 (id bigserial primary key, title text); grant all on public.ren16 to service_role;" >/dev/null
+wait_until "[ \"\$(tracked public.ren16)\" = 1 ]" 10
+q "alter table public.ren16 rename column title to headline" >/dev/null
+q "insert into public.ren16 (headline) values ('after column rename')" >/dev/null
+q "create table public.inh16 (id bigint primary key, note text); create table public.inh16_child (extra text) inherits (public.inh16);
+   grant all on public.inh16, public.inh16_child to service_role;" >/dev/null
+wait_until "[ \"\$(tracked public.inh16_child)\" = 1 ] && [ \"\$(q \"select ezlogs.attach_needed('public.inh16')\")\" = f ]" 10
+q "insert into public.inh16 values (1, 'parent row'); insert into public.inh16_child values (2, 'child row', 'x'); update public.inh16 set note = note || ' changed'; delete from public.inh16" >/dev/null
+wait_until "[ \"\$(outbox)\" = 0 ]" 20
+expect "a column renamed after attach is recorded under its new name at once" "
+r=[r for r in rows if r['table']=='ren16']
+assert len(r)==1 and r[0]['new'].get('headline')=='after column rename', r"
+expect "a write through an INHERITS parent records each row once, under its own table" "
+got=sorted((r['table'], r['op'], r['resource_id']) for r in rows if r['table'] in ('inh16', 'inh16_child'))
+assert got==sorted([('inh16','INSERT','1'),('inh16_child','INSERT','2'),('inh16','UPDATE','1'),('inh16_child','UPDATE','2'),('inh16','DELETE','1'),('inh16_child','DELETE','2')]), got"
+# A new child of a parent that is busy (an open write holds it): the child is tracked at once, the
+# parent moves to row capture on the flush job's next run, not 10 minutes later.
+q "create table public.inh17 (id bigint primary key, note text); grant all on public.inh17 to service_role;" >/dev/null
+wait_until "[ \"\$(tracked public.inh17)\" = 1 ]" 10
+psql "$DB" -X -q -c "begin; insert into public.inh17 values (100, 'held'); select pg_sleep(4); commit;" >/dev/null 2>&1 &
+HOLDER=$!
+sleep 1
+q "create table public.inh17_child (extra text) inherits (public.inh17); grant all on public.inh17_child to service_role;" >/dev/null 2>&1
+check "a new INHERITS child is tracked at once, even while its parent is busy" test "$(tracked public.inh17_child)" = 1
+wait $HOLDER
+wait_until "[ \"\$(q \"select ezlogs.attach_needed('public.inh17')\")\" = f ]" 30
+check "the busy parent is re-attached on the flush job's next runs" test "$(q "select ezlogs.attach_needed('public.inh17')")" = f
+q "insert into public.inh17_child values (101, 'child', 'x'); update public.inh17 set note = note || ' changed' where id = 101" >/dev/null
+wait_until "[ \"\$(outbox)\" = 0 ]" 20
+expect "after the retry, a write through the busy parent records the child's row once" "
+got=sorted((r['table'], r['op']) for r in rows if r['resource_id']=='101' and r['table'] in ('inh17', 'inh17_child'))
+assert got==[('inh17_child','INSERT'),('inh17_child','UPDATE')], got"
+
 echo "== new tables are tracked as soon as they are created"
 q "create table public.later_table (id bigserial primary key, label text); grant all on public.later_table to service_role;" >/dev/null
 q "insert into public.later_table(label) values ('born later')" >/dev/null
@@ -684,8 +722,8 @@ wait_until "[ \"\$(outbox)\" = 0 ]" 30
 check "an upgrade sends the sessions still valid again (EZLogs keeps one per id)" test "$(outbox)" = 0
 
 echo "== status and uninstall"
-check "connect says which version is running" bash -c "psql '$DB' -X -At -c \"select ezlogs.connect('$KEY')\" | grep -q '^Connected (EZLogs 1.5.2)\. Now recording changes to '"
-check "status reports the connection" python3 -I -c "import json,sys; s=json.loads(sys.argv[1]); assert s['connected'] and s['version']=='1.5.2' and s['waiting_rows']==0 and s['dropped_total']>=1, s" "$(q 'select ezlogs.status()')"
+check "connect says which version is running" bash -c "psql '$DB' -X -At -c \"select ezlogs.connect('$KEY')\" | grep -q '^Connected (EZLogs 1.5.3)\. Now recording changes to '"
+check "status reports the connection" python3 -I -c "import json,sys; s=json.loads(sys.argv[1]); assert s['connected'] and s['version']=='1.5.3' and s['waiting_rows']==0 and s['dropped_total']>=1, s" "$(q 'select ezlogs.status()')"
 check "the table created before connect is tracked since" test "$(tracked public.pre_connect)" = 1
 check "uninstall" q "select ezlogs.uninstall()"
 check "no triggers, no schema, no key, no job are left" test "$(q "select (select count(*) from pg_trigger where tgname like 'ezlogs\_capture%') + (select count(*) from pg_namespace where nspname='ezlogs') + (select count(*) from vault.secrets where name='ezlogs_ingest_key') + (select count(*) from cron.job where jobname='ezlogs-flush') + (select count(*) from pg_event_trigger where evtname='ezlogs_track_tables')")" = 0

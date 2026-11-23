@@ -216,7 +216,7 @@ CREATE TABLE IF NOT EXISTS ezlogs.tx_marks (
 -- Constants
 -- ---------------------------------------------------------------------------------------
 
-CREATE OR REPLACE FUNCTION ezlogs.version() RETURNS text LANGUAGE sql IMMUTABLE AS $$ SELECT '1.5.2' $$;
+CREATE OR REPLACE FUNCTION ezlogs.version() RETURNS text LANGUAGE sql IMMUTABLE AS $$ SELECT '1.5.3' $$;
 
 -- Where data goes. A constant, never a setting: nothing inside the database can point the
 -- capture at another host.
@@ -269,12 +269,15 @@ AS $$ SELECT to_jsonb(format('[%s bytes, not recorded]', bytes)) $$;
 -- bulk step, like Rails' update_all), never one row each.
 CREATE OR REPLACE FUNCTION ezlogs.bulk_threshold() RETURNS int LANGUAGE sql IMMUTABLE AS $$ SELECT 100 $$;
 
--- Read once per transaction (ezlogs.begin_capture): when true, nothing is recorded (see state).
+-- Whether capture is paused (see state). begin_capture reads the flag itself since 1.5.3; kept for a
+-- begin_capture from an older version that still calls it while an upgrade runs.
 CREATE OR REPLACE FUNCTION ezlogs.capture_paused() RETURNS boolean
   LANGUAGE sql STABLE
 AS $$ SELECT EXISTS (SELECT 1 FROM ezlogs.state WHERE one AND capture_paused_at IS NOT NULL) $$;
 
--- Called by every capture before it records: true to record, false while capture is paused.
+-- Called by every capture before it records: true to record, false while capture is paused or
+-- the database was never connected (1.5.3: a branch, a preview or a `db reset` that runs this file
+-- but never ezlogs.connect() records nothing, so nothing waits in the outbox that nobody ships).
 -- The first call in a transaction marks it (shipping then runs once, at its commit; while paused
 -- the commit still wakes the flush job, which resumes capture) and reads the pause flag; later
 -- calls in the same transaction read both from a transaction-local setting, never a table.
@@ -285,13 +288,18 @@ AS $$
 DECLARE
   tx     text := txid_current()::text;
   cached text := current_setting('ezlogs.tx', true);
+  live   boolean;
   paused boolean;
 BEGIN
   IF cached LIKE tx || ':%' THEN
     RETURN cached = tx || ':record';
   END IF;
+  SELECT connected_at IS NOT NULL, capture_paused_at IS NOT NULL INTO live, paused FROM ezlogs.state WHERE one;
+  IF live IS NOT TRUE THEN
+    PERFORM set_config('ezlogs.tx', tx || ':off', true);
+    RETURN false;
+  END IF;
   INSERT INTO ezlogs.tx_marks (txid) VALUES (tx::bigint) ON CONFLICT DO NOTHING;
-  paused := ezlogs.capture_paused();
   PERFORM set_config('ezlogs.tx', tx || CASE WHEN paused THEN ':paused' ELSE ':record' END, true);
   RETURN NOT paused;
 END;
@@ -812,6 +820,16 @@ AS $$
       OR ezlogs.is_sensitive_key(table_name)
 $$;
 
+-- A plain table with old-style INHERITS parents or children (not partitions): captured row by
+-- row (1.5.3). A statement on the parent hands its trigger the children's rows too, while each
+-- row trigger fires only for its own table's rows, so every row is recorded once, under its table.
+CREATE OR REPLACE FUNCTION ezlogs.in_inheritance(target regclass) RETURNS boolean
+  LANGUAGE sql STABLE
+AS $$
+  SELECT EXISTS (SELECT 1 FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid
+                  WHERE (i.inhparent = target OR i.inhrelid = target) AND NOT c.relispartition)
+$$;
+
 -- Attach (or refresh) the capture trigger on one public table, unless it is skipped or a
 -- person excluded it. Leaves a table whose trigger already has the current arguments alone.
 -- Never waits for a table lock: a busy table is attached on a later run.
@@ -829,7 +847,8 @@ AS $$
     (SELECT string_agg(i.indkey::text, ',') FROM pg_index i WHERE i.indrelid = target AND i.indisprimary),
     (SELECT string_agg(c.condeferrable::text, ',') FROM pg_constraint c WHERE c.conrelid = target AND c.contype = 'p'),
     (SELECT columns::text FROM ezlogs.ignored_columns WHERE table_oid = target),
-    (SELECT column_name FROM ezlogs.record_names WHERE table_oid = target)))
+    (SELECT column_name FROM ezlogs.record_names WHERE table_oid = target),
+    (SELECT 'inherits' WHERE ezlogs.in_inheritance(target))))
 $$;
 
 -- A column's name as EZLogs' server compares it (lowercase, no underscores), and the table's
@@ -907,7 +926,8 @@ BEGIN
   -- and new rows can't be paired) and for a partitioned table (a statement trigger on the parent
   -- misses writes made to a partition directly; a row trigger is cloned onto every partition).
   -- A deferrable key can be swapped within one statement (id = 3 - id), which would pair rows wrongly.
-  IF pk IS NULL OR pk_eq IS NULL OR ezlogs.is_sensitive_key(pk) OR rel.relkind = 'p'
+  -- An INHERITS parent or child too (ezlogs.in_inheritance).
+  IF pk IS NULL OR pk_eq IS NULL OR ezlogs.is_sensitive_key(pk) OR rel.relkind = 'p' OR ezlogs.in_inheritance(target)
      OR EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = target AND contype = 'p' AND condeferrable) THEN
     RETURN ezlogs.attach_rows(target, rel, pk);
   END IF;
@@ -1355,6 +1375,8 @@ BEGIN
     BEGIN
       IF ezlogs.attach_needed(t) AND ezlogs.attach(t) THEN n := n + 1; END IF;
     EXCEPTION WHEN others THEN
+      -- A busy table (its lock not taken in 100 ms): tried again next run, 5 seconds later.
+      pending := true;
       RAISE WARNING '[ezlogs] could not track % now (retried later): %', t, SQLERRM;
     END;
   END LOOP;
@@ -1425,17 +1447,38 @@ CREATE OR REPLACE FUNCTION ezlogs.on_ddl() RETURNS event_trigger
   SET search_path = ezlogs, pg_temp
 AS $$
 DECLARE
-  r record;
+  r      record;
+  missed boolean := false;
 BEGIN
   IF NOT ezlogs.connected() THEN
     RETURN;
   END IF;
-  FOR r IN SELECT objid FROM pg_event_trigger_ddl_commands()
-            WHERE command_tag IN ('CREATE TABLE', 'ALTER TABLE', 'CREATE TABLE AS', 'SELECT INTO')
-              AND object_type = 'table' AND schema_name = 'public'
+  -- ALTER TABLE ... RENAME COLUMN reports a 'table column' (objid is still the table): 1.5.3.
+  -- A new INHERITS child re-attaches its parents too (they move to row capture, ezlogs.in_inheritance).
+  FOR r IN SELECT DISTINCT t.objid FROM pg_event_trigger_ddl_commands() d
+            CROSS JOIN LATERAL (SELECT d.objid UNION
+                                SELECT i.inhparent FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid
+                                 WHERE i.inhrelid = d.objid AND NOT c.relispartition) t
+            WHERE d.command_tag IN ('CREATE TABLE', 'ALTER TABLE', 'CREATE TABLE AS', 'SELECT INTO')
+              AND d.object_type IN ('table', 'table column') AND d.schema_name = 'public'
   LOOP
-    PERFORM ezlogs.attach(r.objid::regclass);
+    -- Each table on its own: a busy parent (its lock not taken in 100 ms) never undoes its new child.
+    BEGIN
+      PERFORM ezlogs.attach(r.objid::regclass);
+    EXCEPTION WHEN others THEN
+      missed := true;
+      RAISE WARNING '[ezlogs] could not track % now (retried in a few seconds): %', r.objid::regclass, SQLERRM;
+    END;
   END LOOP;
+  -- What was missed is attached by the flush job's next run (5 seconds), not in 10 minutes.
+  IF missed THEN
+    BEGIN
+      UPDATE ezlogs.state SET last_reconciled = NULL WHERE one;
+      PERFORM ezlogs.ensure_flush_job();
+    EXCEPTION WHEN others THEN
+      RAISE WARNING '[ezlogs] could not ask for a retry (the flush job picks it up later): %', SQLERRM;
+    END;
+  END IF;
   -- A renamed table keeps its name setting under its new name. Its own block: a failure here
   -- never undoes the tracking above.
   BEGIN
