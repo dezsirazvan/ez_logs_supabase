@@ -15,6 +15,10 @@
 --     new session's id and user only) and on storage.objects (files), writing into ezlogs.outbox
 --     with sensitive and ignored columns removed (inside json too) and large values replaced by
 --     their size; an update carries what changed; a statement over 100 rows is one bulk row;
+--   * once, after connect: the id and name of existing rows of the tables other tables point at
+--     (classes a booking names), so a new booking reads "for class 'Power Hour'" even if that
+--     class never changes; never tables tied to sign-in accounts or named like people or
+--     accounts; ezlogs.untrack() leaves any other table out (ezlogs.send_record_names);
 --   * who did it comes from the login Supabase already verified (request.jwt.claims);
 --   * when a writing transaction commits, at most once a second, the database posts what is
 --     waiting to EZLogs with pg_net; rows leave the outbox only after EZLogs confirmed them;
@@ -188,6 +192,9 @@ SELECT ezlogs.ensure_column('ezlogs.state', 'capture_paused_reason', 'text');
 SELECT ezlogs.ensure_column('ezlogs.state', 'blocked_since', 'timestamptz');
 -- The outbox's size cap in bytes, measured at reconcile: 50 MB or 5% of the database, the smaller.
 SELECT ezlogs.ensure_column('ezlogs.state', 'outbox_cap_bytes', 'bigint');
+-- When the names of rows that existed before the install were sent (1.5.4, ezlogs.send_record_names):
+-- once per install, never again on a re-run or a re-connect.
+SELECT ezlogs.ensure_column('ezlogs.state', 'names_sent_at', 'timestamptz');
 INSERT INTO ezlogs.state (one) VALUES (true) ON CONFLICT DO NOTHING;
 
 -- Tables a person took out with ezlogs.untrack(); nothing puts them back but ezlogs.track().
@@ -207,6 +214,10 @@ CREATE TABLE IF NOT EXISTS ezlogs.ignored_columns (table_oid oid PRIMARY KEY, co
 
 -- One row per writing transaction (1.5.0): its deferred trigger ships at commit, once, however
 -- many rows the transaction wrote. Cleared at commit and by the flush job.
+-- Tables whose rows' names ezlogs.send_record_names already sent (1.5.4), and how many: a table
+-- skipped because it was locked is tried again, and none is sent twice.
+CREATE TABLE IF NOT EXISTS ezlogs.names_sent (table_oid oid PRIMARY KEY, row_count int NOT NULL);
+
 CREATE TABLE IF NOT EXISTS ezlogs.tx_marks (
   txid      bigint      PRIMARY KEY DEFAULT txid_current(),
   marked_at timestamptz NOT NULL DEFAULT clock_timestamp()
@@ -216,7 +227,7 @@ CREATE TABLE IF NOT EXISTS ezlogs.tx_marks (
 -- Constants
 -- ---------------------------------------------------------------------------------------
 
-CREATE OR REPLACE FUNCTION ezlogs.version() RETURNS text LANGUAGE sql IMMUTABLE AS $$ SELECT '1.5.3' $$;
+CREATE OR REPLACE FUNCTION ezlogs.version() RETURNS text LANGUAGE sql IMMUTABLE AS $$ SELECT '1.5.4' $$;
 
 -- Where data goes. A constant, never a setting: nothing inside the database can point the
 -- capture at another host.
@@ -1322,6 +1333,125 @@ BEGIN
 END;
 $$;
 
+-- A name column's value as EZLogs names a row by it (EventIngest::PostgresRows#display_name_for):
+-- a string or a number, trimmed, never empty; at most 120 characters.
+CREATE OR REPLACE FUNCTION ezlogs.name_value(v jsonb) RETURNS text
+  LANGUAGE sql IMMUTABLE
+AS $$
+  SELECT CASE WHEN jsonb_typeof(v) IN ('string', 'number') THEN NULLIF(left(btrim(v #>> '{}'), 120), '') END
+$$;
+
+-- A table of people or of the accounts they belong to, by its name (whole, or its last word:
+-- team_members), singular: the person and tenant nouns of the server's
+-- Summary::Headline::CONTEXT_FK_SKIP (test/run.sh keeps the two lists the same), and `people`.
+CREATE OR REPLACE FUNCTION ezlogs.people_table(table_name text) RETURNS boolean
+  LANGUAGE sql IMMUTABLE
+AS $$
+  SELECT EXISTS (SELECT 1 FROM unnest(ARRAY[table_name, regexp_replace(table_name, '^.*_', '')]) n
+                  WHERE left(ezlogs.numbered_norm(n), -6)
+                        ~ '^(user|owner|author|creator|assignee|reporter|account|company|tenant|organization|org|team|workspace|member|customer|client|profile|person|contact|employee|people)$')
+$$;
+
+-- Once per install (1.5.4), from the flush job after connect: the names of rows that existed before
+-- the install. Names are otherwise learned only from captured changes, so a row nobody changes
+-- since (a class) stays unnamed where another row points at it ("Created booking #67ab…").
+-- What leaves: for each tracked table another app table points at by a foreign key, its rows' key
+-- and the value of the one column EZLogs names its rows by (the same choice as the server:
+-- ezlogs.name_records, else name, title, number, label, <record>number), nothing else.
+-- Left out: a table with one row per sign-in account (a foreign key to auth.users on a column that
+-- is unique on its own: profiles.id, athletes.user_id UNIQUE; a created_by is not), one named like
+-- people or the accounts they belong to (members, customers, team_members, companies:
+-- ezlogs.people_table), or with a column of a person's name, e-mail or phone; a table a person
+-- untracked (ezlogs.untrack). A name list can't recognise every table of people: untrack one. Never a column
+-- named like a secret or one a person left out.
+-- Bounded: the 1,000 rows with the highest keys per table (read backwards through the primary key
+-- index: newest for a serial key), 10,000 in all (about 2 MB queued, well under the outbox's 10 MB
+-- floor), small tables first, so the most tables are named in full. Sent as outbox rows
+-- (schema 'ezlogs', table 'record_names'), which EZLogs stores as names, never as changes.
+CREATE OR REPLACE FUNCTION ezlogs.send_record_names() RETURNS void
+  LANGUAGE plpgsql
+  SECURITY DEFINER
+  SET search_path = ezlogs, pg_temp
+AS $$
+DECLARE
+  t      record;
+  pk     text;
+  names  text;
+  room    int := 10000 - (SELECT COALESCE(sum(row_count), 0) FROM ezlogs.names_sent);
+  n       int;
+  pending boolean := false;
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM ezlogs.state WHERE one AND connected_at IS NOT NULL AND names_sent_at IS NULL
+                                               AND capture_paused_at IS NULL) THEN
+    RETURN;
+  END IF;
+  FOR t IN SELECT c.oid::regclass AS rel, c.relname FROM pg_class c
+            WHERE c.relnamespace = 'public'::regnamespace AND c.relkind IN ('r', 'p') AND NOT c.relispartition
+              AND (NOT ezlogs.skipped(c.relname) OR EXISTS (SELECT 1 FROM ezlogs.tracked k WHERE k.table_oid = c.oid))
+              AND NOT EXISTS (SELECT 1 FROM ezlogs.excluded e WHERE e.table_oid = c.oid)
+              AND NOT EXISTS (SELECT 1 FROM ezlogs.names_sent d WHERE d.table_oid = c.oid)
+              AND EXISTS (SELECT 1 FROM pg_constraint f JOIN pg_class r ON r.oid = f.conrelid
+                           WHERE f.contype = 'f' AND f.confrelid = c.oid AND f.conrelid <> c.oid
+                             AND r.relnamespace = 'public'::regnamespace)
+              AND NOT ezlogs.people_table(c.relname)
+              -- one row per sign-in account: a foreign key to auth.users on a column unique on its own
+              AND NOT EXISTS (SELECT 1 FROM pg_constraint f JOIN pg_index i ON i.indrelid = f.conrelid AND i.indisunique
+                               WHERE f.contype = 'f' AND f.conrelid = c.oid AND f.confrelid = to_regclass('auth.users')
+                                 AND i.indnkeyatts = 1 AND f.conkey = ARRAY[i.indkey[0]])
+              AND NOT EXISTS (SELECT 1 FROM pg_attribute a WHERE a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
+                               AND ezlogs.name_norm(a.attname) ~ '(firstname|lastname|fullname|givenname|familyname|displayname|email|phone)')
+            ORDER BY greatest(c.reltuples, 0), c.oid
+  LOOP
+    EXIT WHEN room <= 0;
+    BEGIN
+      pk := NULL;
+      SELECT a.attname INTO pk
+        FROM pg_index i JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
+       WHERE i.indrelid = t.rel AND i.indisprimary AND array_length(i.indkey, 1) = 1;
+      IF pk IS NULL OR ezlogs.is_sensitive_key(pk) THEN
+        INSERT INTO ezlogs.names_sent VALUES (t.rel, 0);
+        CONTINUE;
+      END IF;
+      -- The name columns in the server's order: the one set with name_records, then name, title,
+      -- number, label, <record>number (any case or underscores).
+      SELECT string_agg(format('ezlogs.name_value(to_jsonb(%I))', a.attname),
+                        ', ' ORDER BY CASE WHEN a.attname = r.column_name THEN 0
+                                           ELSE array_position(ARRAY['name', 'title', 'number', 'label', ezlogs.numbered_norm(t.relname)],
+                                                               ezlogs.name_norm(a.attname)) END, a.attnum)
+        INTO names
+        FROM pg_attribute a LEFT JOIN ezlogs.record_names r ON r.table_oid = t.rel
+       WHERE a.attrelid = t.rel AND a.attnum > 0 AND NOT a.attisdropped AND a.attname <> pk
+         AND NOT ezlogs.is_sensitive_key(a.attname)
+         AND NOT a.attname = ANY(COALESCE((SELECT columns FROM ezlogs.ignored_columns WHERE table_oid = t.rel), '{}'))
+         AND (ezlogs.name_norm(a.attname) IN ('name', 'title', 'number', 'label', ezlogs.numbered_norm(t.relname))
+              OR a.attname = r.column_name);
+      IF names IS NULL THEN
+        INSERT INTO ezlogs.names_sent VALUES (t.rel, 0);
+        CONTINUE;
+      END IF;
+      EXECUTE format('INSERT INTO ezlogs.outbox (schema_name, table_name, op, new_row, resource_id) '
+                     'SELECT ''ezlogs'', ''record_names'', ''INSERT'', jsonb_build_object(''table'', %L, ''id'', s.id, ''name'', s.name), s.id '
+                     'FROM (SELECT %I::text AS id, COALESCE(%s) AS name FROM %s ORDER BY %I DESC LIMIT %s) s '
+                     'WHERE s.name IS NOT NULL AND length(s.id) <= 200',
+                     t.relname, pk, names, t.rel, pk, least(1000, room));
+      GET DIAGNOSTICS n = ROW_COUNT;
+      room := room - n;
+      INSERT INTO ezlogs.names_sent VALUES (t.rel, n);
+    EXCEPTION
+      WHEN lock_not_available THEN
+        -- Locked by a migration right now: tried again at the next reconcile.
+        pending := true;
+      WHEN others THEN
+        RAISE WARNING '[ezlogs] could not read the names of % (left unnamed): %', t.rel, SQLERRM;
+        INSERT INTO ezlogs.names_sent VALUES (t.rel, 0) ON CONFLICT DO NOTHING;
+    END;
+  END LOOP;
+  IF NOT pending THEN
+    UPDATE ezlogs.state SET names_sent_at = now() WHERE one;
+  END IF;
+END;
+$$;
+
 -- Capture functions (cap_<oid>_*) whose table is gone: at most 100 per call.
 CREATE OR REPLACE FUNCTION ezlogs.drop_orphan_captures() RETURNS void
   LANGUAGE plpgsql
@@ -1361,6 +1491,12 @@ BEGIN
     RETURN 0;
   END IF;
   PERFORM ezlogs.attach_platform();
+  -- Once per install (1.5.4); its own block, so it never stops tables being attached.
+  BEGIN
+    PERFORM ezlogs.send_record_names();
+  EXCEPTION WHEN others THEN
+    RAISE WARNING '[ezlogs] could not send record names (retried later): %', SQLERRM;
+  END;
   -- At most 10 tables (re)attached per run, each holding its lock only until this run commits,
   -- so an install or an upgrade on a large schema never blocks the app's writes for long; the
   -- rest wait for the next run (5 seconds later).

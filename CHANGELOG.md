@@ -1,5 +1,29 @@
 # Changelog
 
+## 1.5.4
+
+- Rows that existed before the install are named. EZLogs learned a row's name only from a change
+  it captured, so a new booking of a class nobody changed since read "Created booking #67ab…6d59".
+  Once, from the flush job after `connect()`, the install sends the id and name of existing rows
+  of each tracked table another app table points to by a foreign key (the classes bookings point
+  to), as rows of schema `ezlogs`, table `record_names`: `{table, id, name}`, nothing else. The
+  name is the column EZLogs names that table's rows by (`ezlogs.name_records`, else `name`,
+  `title`, `number`, `label`, `<record>_number`), never a column named like a secret or one left
+  out with `ignore_columns`. Left out: a table with one row per sign-in account (a foreign key to
+  `auth.users` on a column unique on its own: `profiles.id`, a `user_id UNIQUE`; a plain
+  `created_by` pointing there does not count), one named like people or the accounts they belong to (whole name or last word, singular:
+  the server's person and tenant nouns, `members`, `customers`, `team_members`, `companies`), and
+  one with a column for a person's name, email or phone. A name list can't recognise every table
+  of people (`coaches`, `students`): leave any table out with `select ezlogs.untrack('public.<table>');`.
+  At most 1,000 rows per table (the highest keys, read through the primary key) and 10,000 in
+  all, small tables first. Sent once per install (`ezlogs.names_sent`, `ezlogs.state.names_sent_at`):
+  a table a migration holds locked is tried again at the next reconcile, and re-applying the
+  file or running `connect` again sends nothing more; an install upgraded from 1.5.3 sends them
+  once, at its next flush. EZLogs keeps them, until the account is deleted, only to name those rows from that moment on
+  (the newest name it knows at the time of an action wins): no action, no Timeline entry, no alert,
+  no count, and an action before the install is never renamed. Servers older than this skip
+  such rows.
+
 ## 1.5.3
 
 - A database that never ran `ezlogs.connect()` records nothing. A Supabase branch, a preview, a

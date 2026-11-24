@@ -62,7 +62,7 @@ assert a and a == b, (a, b)"
 echo "== setup: a small app (tables, RLS, a storage bucket)"
 q "select ezlogs.uninstall()" >/dev/null 2>&1
 psql "$DB" -X -q -v ON_ERROR_STOP=1 <<'SQL' || { echo "app setup failed"; exit 1; }
-DROP TABLE IF EXISTS public.items, public.feedback, public.later_table, public.pre_connect, public.api_tokens, public.wide, public.invoices, public.bills, public."order-items", public.docs15, public.bulk15, public.pairs15, public.vars15, public.keys15, public.orders15, public.purchases15, public.emb15, public.part15, public.pairs16, public.boxes, public.huge15, public.orphan15, public.schema_migrations_x, public.ar_internal_metadata, public.alias15, public.defer15, public.vc15, public.solo15, public.parent15, public.plain15, public.app_secrets15, public.stale15, public.big15, public.types15, public.ren16, public.inh16_child, public.inh16, public.inh17_child, public.inh17 CASCADE;
+DROP TABLE IF EXISTS public.items, public.feedback, public.later_table, public.pre_connect, public.api_tokens, public.wide, public.invoices, public.bills, public."order-items", public.docs15, public.bulk15, public.pairs15, public.vars15, public.keys15, public.orders15, public.purchases15, public.emb15, public.part15, public.pairs16, public.boxes, public.huge15, public.orphan15, public.schema_migrations_x, public.ar_internal_metadata, public.alias15, public.defer15, public.vc15, public.solo15, public.parent15, public.plain15, public.app_secrets15, public.stale15, public.big15, public.types15, public.ren16, public.inh16_child, public.inh16, public.inh17_child, public.inh17, public.bookings154, public.classes154, public.profiles154, public.contacts154, public.members, public.team_members, public.coach_bios154, public.athletes154 CASCADE;
 CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA extensions;
 CREATE TABLE public.items (id bigserial PRIMARY KEY, name text UNIQUE NOT NULL, secret_token text,
                            settings jsonb, notes text, pairs jsonb[], created_by uuid DEFAULT auth.uid());
@@ -77,6 +77,39 @@ GRANT INSERT ON public.feedback TO anon; GRANT USAGE ON SEQUENCE public.feedback
 INSERT INTO storage.buckets (id, name, public) VALUES ('files', 'files', false) ON CONFLICT DO NOTHING;
 DROP POLICY IF EXISTS files_rw ON storage.objects;
 CREATE POLICY files_rw ON storage.objects FOR ALL TO authenticated USING (bucket_id = 'files') WITH CHECK (bucket_id = 'files');
+-- 1.5.4: rows that exist before the install. A class a booking points at; a profile (a person:
+-- keyed by auth.users) a booking points at too; a contact list (a person's e-mail) the same.
+DELETE FROM auth.users WHERE id = '00000000-0000-0000-0000-0000000001a4';
+INSERT INTO auth.users (id, aud, role, email) VALUES ('00000000-0000-0000-0000-0000000001a4', 'authenticated', 'authenticated', 'member154@example.com');
+CREATE TABLE public.profiles154 (id uuid PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE, name text, full_name text);
+-- A row per sign-in account (its key is the account's id), named like nothing in particular.
+CREATE TABLE public.coach_bios154 (id uuid PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE, title text);
+-- One row per account through a unique user_id: a table of people under another name.
+CREATE TABLE public.athletes154 (id bigserial PRIMARY KEY, user_id uuid UNIQUE REFERENCES auth.users(id), name text);
+CREATE TABLE public.contacts154 (id bigserial PRIMARY KEY, name text, email text);
+-- Made by an account (created_by -> auth.users): still a class, not a person.
+CREATE TABLE public.classes154 (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), name text NOT NULL, coach_notes text, api_token text,
+  created_by uuid REFERENCES auth.users(id));
+-- Tables of people only by their name: no auth.users key, no e-mail column.
+CREATE TABLE public.members (id bigserial PRIMARY KEY, name text, profile_id uuid REFERENCES public.profiles154(id));
+CREATE TABLE public.team_members (id bigserial PRIMARY KEY, label text);
+CREATE TABLE public.bookings154 (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), title text,
+  class_id uuid REFERENCES public.classes154(id), member_id uuid REFERENCES public.profiles154(id),
+  coach_id uuid REFERENCES public.coach_bios154(id), athlete_id bigint REFERENCES public.athletes154(id),
+  contact_id bigint REFERENCES public.contacts154(id), member2_id bigint REFERENCES public.members(id),
+  team_member_id bigint REFERENCES public.team_members(id));
+INSERT INTO public.members (name) VALUES ('Mona Member');
+INSERT INTO public.team_members (label) VALUES ('Tess Team');
+INSERT INTO public.profiles154 VALUES ('00000000-0000-0000-0000-0000000001a4', 'Maria Member', 'Maria Full');
+INSERT INTO public.coach_bios154 VALUES ('00000000-0000-0000-0000-0000000001a4', 'Bianca Bio');
+INSERT INTO public.athletes154 (user_id, name) VALUES ('00000000-0000-0000-0000-0000000001a4', 'Ari Athlete');
+INSERT INTO public.contacts154 (name, email) VALUES ('Carl Contact', 'carl@example.com');
+INSERT INTO public.classes154 (id, name, coach_notes, api_token, created_by)
+  SELECT CASE WHEN g = 1 THEN 'ffffffff-0000-0000-0000-0000000001c1'::uuid ELSE gen_random_uuid() END,
+         CASE WHEN g = 1 THEN 'Power Hour' WHEN g = 2 THEN '   ' ELSE 'Class ' || g END, 'private notes', 'tok_secret',
+         '00000000-0000-0000-0000-0000000001a4'
+    FROM generate_series(1, 1500) g;
+INSERT INTO public.bookings154 (title, class_id, member_id) VALUES ('first', 'ffffffff-0000-0000-0000-0000000001c1', '00000000-0000-0000-0000-0000000001a4');
 SQL
 
 echo "== install"
@@ -109,6 +142,52 @@ check "the key is in Vault, not in a table" test "$(q "select count(*) from vaul
 check "public tables, auth.users and storage.objects are tracked" test "$(all_tracked)" -ge 4
 q "create table public.api_tokens (id bigserial primary key, value text)" >/dev/null
 check "a table named like a secret is not tracked" test "$(tracked public.api_tokens)" = 0
+
+echo "== 1.5.4: the names of rows that existed before the install, once"
+names_sent() { python3 -I -c "import json;print(sum(1 for l in open('$LOG') if l.strip() for r in json.loads(l)['body']['rows'] if r['schema']=='ezlogs'))"; }
+wait_until "[ \"\$(q \"select names_sent_at is not null from ezlogs.state\")\" = t ] && [ \"\$(outbox)\" = 0 ]" 60
+expect "only tables other tables point to are named (a class made by an account is; a table keyed by the account, named like people or with an email is not)" "
+n=[r for r in rows if r['schema']=='ezlogs']
+assert n and {r['table'] for r in n}=={'record_names'}, n[:3]
+assert {r['new']['table'] for r in n}=={'classes154'}, {r['new']['table'] for r in n}"
+expect "each carries only the key and the name, never another column" "
+n=[r for r in rows if r['schema']=='ezlogs']
+assert all(set(r['new'])=={'table','id','name'} and r['old'] is None and r['claims'] is None and r['resource_id']==r['new']['id'] for r in n)
+assert not any(w in json.dumps(r) for r in rows for w in ('private notes', 'tok_secret', 'Maria', 'Carl', 'Mona', 'Tess', 'Bianca', 'Ari Athlete'))"
+expect "at most 1,000 rows per table, the highest keys first, empty names left out" "
+n=[r for r in rows if r['schema']=='ezlogs']
+assert 990 <= len(n) <= 1000, len(n)
+assert all(r['new']['name'] and r['new']['name'].strip()==r['new']['name'] for r in n)
+assert any(r['new']['id']=='ffffffff-0000-0000-0000-0000000001c1' and r['new']['name']=='Power Hour' for r in n)"
+SENT="$(names_sent)"
+check "tables named like people are the server's person and tenant nouns (CONTEXT_FK_SKIP)" python3 -I -c "$(cat <<PY
+import re
+server = open('$HERE/../../ez_logs_server/app/domain/summary/headline.rb').read().split('CONTEXT_FK_SKIP = /')[1].split('/x')[0]
+server = set(re.findall(r'[a-z_]+', server)) - {'created_by', 'updated_by', 'deleted_by', 'parent', 'session', 'request', 'z'}
+sql = open('$INSTALL').read().split('FUNCTION ezlogs.people_table')[1].split("~ '^(")[1].split(")")[0]
+assert server == set(sql.split('|')) - {'people'}, server ^ set(sql.split('|'))
+PY
+)"
+psql "$DB" -X -q -v ON_ERROR_STOP=1 -f "$INSTALL" >/dev/null
+q "CREATE OR REPLACE FUNCTION ezlogs.endpoint() RETURNS text LANGUAGE sql IMMUTABLE AS \$\$ SELECT '$ENDPOINT' \$\$" >/dev/null
+q "select ezlogs.connect('$KEY')" >/dev/null
+q "select ezlogs.reconcile()" >/dev/null
+check "re-applying the install and connecting again sends no names again" test "$(names_sent):$(q "select count(*) from ezlogs.outbox where schema_name = 'ezlogs'")" = "$SENT:0"
+# A table a migration holds locked is tried again later; the others are not sent twice.
+wait_until "[ \"\$(outbox)\" = 0 ]" 30
+q "delete from ezlogs.names_sent; update ezlogs.state set names_sent_at = null, paused_until = now() + interval '2 minutes'" >/dev/null   # nothing ships meanwhile
+psql "$DB" -X -q -c "begin; lock table public.classes154 in access exclusive mode; select pg_sleep(4); commit" >/dev/null &
+LOCKER=$!
+sleep 1
+check "the call with a table locked still succeeds" psql "$DB" -X -q -v ON_ERROR_STOP=1 -c "set lock_timeout = '200ms'; select ezlogs.send_record_names()"
+check "a locked table leaves the names unfinished, unmarked, and sends nothing for it" test "$(q "select (names_sent_at is null)::text || ':' || (select count(*) from ezlogs.outbox where schema_name = 'ezlogs') || ':' || (select count(*) from ezlogs.names_sent where table_oid = 'public.classes154'::regclass) from ezlogs.state")" = "true:0:0"
+wait "$LOCKER"
+q "select ezlogs.send_record_names()" >/dev/null
+check "and it is sent once the lock is gone" test "$(q "select (names_sent_at is not null)::text || ':' || (select count(*) from ezlogs.outbox where schema_name = 'ezlogs' and new_row->>'table' = 'classes154') from ezlogs.state")" = "true:$SENT"
+q "select ezlogs.send_record_names()" >/dev/null
+check "and only once" test "$(q "select count(*) from ezlogs.outbox where schema_name = 'ezlogs'")" = "$SENT"
+q "update ezlogs.state set paused_until = null" >/dev/null
+wait_until "[ \"\$(outbox)\" = 0 ]" 60
 
 echo "== nothing is reachable through Supabase's HTTP API"
 check "the ezlogs schema is not served" bash -c "! curl -sf '$API_URL/rest/v1/outbox' -H 'apikey: $PUBLISHABLE_KEY' -H 'Accept-Profile: ezlogs' >/dev/null"
@@ -158,7 +237,7 @@ expect "an upload names the file and its owner" "
 o=[r for r in rows if r['schema']=='storage' and r['op']=='INSERT'][0]['new']
 assert o['bucket_id']=='files' and o['name'].startswith('$USER_ID/brief-') and o['owner_id']=='$USER_ID' and o['mimetype']=='text/plain', o"
 expect "every post names the install and the version" "
-assert all(p['version']=='1.5.3' and p['install_id'] and p['supabase_url']=='https://local-test.supabase.co' for p in posts)"
+assert all(p['version']=='1.5.4' and p['install_id'] and p['supabase_url']=='https://local-test.supabase.co' for p in posts)"
 check "the key travels only in the Authorization header" python3 -I -c "
 import json
 for l in open('$LOG'):
@@ -722,8 +801,8 @@ wait_until "[ \"\$(outbox)\" = 0 ]" 30
 check "an upgrade sends the sessions still valid again (EZLogs keeps one per id)" test "$(outbox)" = 0
 
 echo "== status and uninstall"
-check "connect says which version is running" bash -c "psql '$DB' -X -At -c \"select ezlogs.connect('$KEY')\" | grep -q '^Connected (EZLogs 1.5.3)\. Now recording changes to '"
-check "status reports the connection" python3 -I -c "import json,sys; s=json.loads(sys.argv[1]); assert s['connected'] and s['version']=='1.5.3' and s['waiting_rows']==0 and s['dropped_total']>=1, s" "$(q 'select ezlogs.status()')"
+check "connect says which version is running" bash -c "psql '$DB' -X -At -c \"select ezlogs.connect('$KEY')\" | grep -q '^Connected (EZLogs 1.5.4)\. Now recording changes to '"
+check "status reports the connection" python3 -I -c "import json,sys; s=json.loads(sys.argv[1]); assert s['connected'] and s['version']=='1.5.4' and s['waiting_rows']==0 and s['dropped_total']>=1, s" "$(q 'select ezlogs.status()')"
 check "the table created before connect is tracked since" test "$(tracked public.pre_connect)" = 1
 check "uninstall" q "select ezlogs.uninstall()"
 check "no triggers, no schema, no key, no job are left" test "$(q "select (select count(*) from pg_trigger where tgname like 'ezlogs\_capture%') + (select count(*) from pg_namespace where nspname='ezlogs') + (select count(*) from vault.secrets where name='ezlogs_ingest_key') + (select count(*) from cron.job where jobname='ezlogs-flush') + (select count(*) from pg_event_trigger where evtname='ezlogs_track_tables')")" = 0
