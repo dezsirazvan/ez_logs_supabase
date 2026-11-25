@@ -1,5 +1,28 @@
 # Changelog
 
+## 1.5.5
+
+- **More credential names are never sent.** A column (or a key inside json) whose name contains
+  `jwt`, `webhook_url` (a Slack or Discord webhook), `connection_string`, `database_url`, `access_key`, `auth_key`, `session_key`, `license_key`, `encryption_key`, `ssh_key`, `master_key`, `mnemonic`, `seed_phrase`, `auth_code`, `reset_code`, `invite_code`, `magic_link`, and `dsn` as a whole word is left out, as `password` and `token` always were; a table named like one is not
+  recorded. Same list as ezlogs-nextjs 0.4.17, the Rails agent 0.2.23 and the EZLogs server, which
+  masks them on arrival for older installs too. Tables re-attach on their own (`patterns_version`
+  `p3`), a few per flush run.
+- **No warnings in Supabase's Security Advisor.** Every `ezlogs` function now pins its
+  `search_path` (lint `function_search_path_mutable`); nothing was reachable before (the schema is
+  closed to the API roles), but the Advisor listed about 30 warnings.
+- **Attaching tables never waits behind the cron history.** The flush job trims its own run history
+  (`cron.job_run_details` has no index on `jobid`, so that reads the whole table) before it takes
+  the locks attaching tables needs, not while holding them.
+- **`ezlogs.uninstall()` and tracking `auth.users` / `storage.objects` wait at most 2 seconds for a
+  busy table.** Uninstall then stops without removing anything ("run it again in a moment"); a
+  platform table is tried again later. Before, they could wait as long as the table was held, and
+  the app's queries on it queued behind them.
+- **`ezlogs.uninstall()` also removes its own job's run history** (`cron.job_run_details` rows of
+  `ezlogs-flush`), and says what stays: your data, and pg_cron and pg_net (other features may use them).
+- `connect()` with a key that isn't a database key names the page by its new name (Install & keys).
+- The file says at the top why your editor warns about DELETE and DROP: each one touches only
+  EZLogs' own rows, job history, functions, triggers, key and schema.
+
 ## 1.5.4
 
 - Rows that existed before the install are named. EZLogs learned a row's name only from a change

@@ -125,9 +125,9 @@ check "nothing is recorded before connect" test "$(q "select (select count(*) fr
 q "select ezlogs.name_records('public.pre_connect', NULL)" >/dev/null
 q "insert into public.pre_connect(label) values ('never connected'); update public.pre_connect set label = 'still never connected'" >/dev/null
 check "a table named before connect still records nothing until connect (no outbox that never ships)" test "$(q "select (select count(*) from ezlogs.outbox) + (select count(*) from ezlogs.tx_marks)")" = 0
-q "CREATE OR REPLACE FUNCTION ezlogs.endpoint() RETURNS text LANGUAGE sql IMMUTABLE AS \$\$ SELECT '$ENDPOINT' \$\$" >/dev/null
+q "CREATE OR REPLACE FUNCTION ezlogs.endpoint() RETURNS text LANGUAGE sql IMMUTABLE SET search_path = ezlogs, pg_temp AS \$\$ SELECT '$ENDPOINT' \$\$" >/dev/null
 check "a bad key is refused with a clear message" bash -c "! psql '$DB' -X -At -c \"select ezlogs.connect('ezl_wrongkind', 'https://abc.supabase.co')\" 2>/dev/null"
-check "a full API key in the SQL editor is told where the database key is" bash -c "psql '$DB' -X -At -c \"select ezlogs.connect('ezl_wrongkind', 'https://abc.supabase.co')\" 2>&1 | grep -q 'Settings, API keys, the Lovable · Bolt · v0 tab'"
+check "a full API key in the SQL editor is told where the database key is" bash -c "psql '$DB' -X -At -c \"select ezlogs.connect('ezl_wrongkind', 'https://abc.supabase.co')\" 2>&1 | grep -q 'Install & keys, Lovable · Bolt · v0, Create install code'"
 KEY="ezldb_$(python3 -c 'import secrets;print(secrets.token_urlsafe(32))')"
 check "connect" q "select ezlogs.connect('$KEY', 'https://local-test.supabase.co')"
 wait_until "python3 -I -c \"import json,sys; sys.exit(0 if any(json.loads(l)['body']['rows']==[] for l in open('$LOG') if l.strip()) else 1)\"" 15
@@ -169,7 +169,7 @@ assert server == set(sql.split('|')) - {'people'}, server ^ set(sql.split('|'))
 PY
 )"
 psql "$DB" -X -q -v ON_ERROR_STOP=1 -f "$INSTALL" >/dev/null
-q "CREATE OR REPLACE FUNCTION ezlogs.endpoint() RETURNS text LANGUAGE sql IMMUTABLE AS \$\$ SELECT '$ENDPOINT' \$\$" >/dev/null
+q "CREATE OR REPLACE FUNCTION ezlogs.endpoint() RETURNS text LANGUAGE sql IMMUTABLE SET search_path = ezlogs, pg_temp AS \$\$ SELECT '$ENDPOINT' \$\$" >/dev/null
 q "select ezlogs.connect('$KEY')" >/dev/null
 q "select ezlogs.reconcile()" >/dev/null
 check "re-applying the install and connecting again sends no names again" test "$(names_sent):$(q "select count(*) from ezlogs.outbox where schema_name = 'ezlogs'")" = "$SENT:0"
@@ -237,7 +237,7 @@ expect "an upload names the file and its owner" "
 o=[r for r in rows if r['schema']=='storage' and r['op']=='INSERT'][0]['new']
 assert o['bucket_id']=='files' and o['name'].startswith('$USER_ID/brief-') and o['owner_id']=='$USER_ID' and o['mimetype']=='text/plain', o"
 expect "every post names the install and the version" "
-assert all(p['version']=='1.5.4' and p['install_id'] and p['supabase_url']=='https://local-test.supabase.co' for p in posts)"
+assert all(p['version']=='1.5.5' and p['install_id'] and p['supabase_url']=='https://local-test.supabase.co' for p in posts)"
 check "the key travels only in the Authorization header" python3 -I -c "
 import json
 for l in open('$LOG'):
@@ -784,7 +784,7 @@ q "drop trigger ezlogs_capture on auth.users; drop trigger ezlogs_capture on sto
 q "select ezlogs.attach_platform()" >/dev/null 2>&1
 check "accounts and files are tracked though sessions could not be" test "$(q "select string_agg(tgrelid::regclass::text, ',' order by tgrelid::regclass::text) from pg_trigger where tgname='ezlogs_capture' and tgrelid in ('auth.users'::regclass, 'storage.objects'::regclass, 'auth.sessions'::regclass)")" = "auth.users,storage.objects"
 psql "$DB" -X -q -v ON_ERROR_STOP=1 -f "$INSTALL" >/dev/null   # restores the function, and the endpoint
-q "CREATE OR REPLACE FUNCTION ezlogs.endpoint() RETURNS text LANGUAGE sql IMMUTABLE AS \$\$ SELECT '$ENDPOINT' \$\$" >/dev/null
+q "CREATE OR REPLACE FUNCTION ezlogs.endpoint() RETURNS text LANGUAGE sql IMMUTABLE SET search_path = ezlogs, pg_temp AS \$\$ SELECT '$ENDPOINT' \$\$" >/dev/null
 check "and sessions are tracked once they can be" test "$(q "select count(*) from pg_trigger where tgname='ezlogs_capture' and tgrelid='auth.sessions'::regclass")" = 1
 
 echo "== upgrade from a version without sessions"
@@ -795,15 +795,23 @@ q "drop trigger ezlogs_capture on auth.sessions" >/dev/null
 check "re-applying the install (no connect) starts reading sessions" bash -c "psql '$DB' -X -q -v ON_ERROR_STOP=1 -f '$INSTALL' && test \"\$(psql '$DB' -X -At -c \"select count(*) from pg_trigger where tgname='ezlogs_capture' and tgrelid='auth.sessions'::regclass\")\" = 1"
 # Re-applying restores the real endpoint (app.ezlogs.io, which refuses this test key): point it
 # back at the test receiver and resume.
-q "CREATE OR REPLACE FUNCTION ezlogs.endpoint() RETURNS text LANGUAGE sql IMMUTABLE AS \$\$ SELECT '$ENDPOINT' \$\$" >/dev/null
+q "CREATE OR REPLACE FUNCTION ezlogs.endpoint() RETURNS text LANGUAGE sql IMMUTABLE SET search_path = ezlogs, pg_temp AS \$\$ SELECT '$ENDPOINT' \$\$" >/dev/null
 q "select ezlogs.connect('$KEY')" >/dev/null
 wait_until "[ \"\$(outbox)\" = 0 ]" 30
 check "an upgrade sends the sessions still valid again (EZLogs keeps one per id)" test "$(outbox)" = 0
 
 echo "== status and uninstall"
-check "connect says which version is running" bash -c "psql '$DB' -X -At -c \"select ezlogs.connect('$KEY')\" | grep -q '^Connected (EZLogs 1.5.4)\. Now recording changes to '"
-check "status reports the connection" python3 -I -c "import json,sys; s=json.loads(sys.argv[1]); assert s['connected'] and s['version']=='1.5.4' and s['waiting_rows']==0 and s['dropped_total']>=1, s" "$(q 'select ezlogs.status()')"
+check "connect says which version is running" bash -c "psql '$DB' -X -At -c \"select ezlogs.connect('$KEY')\" | grep -q '^Connected (EZLogs 1.5.5)\. Now recording changes to '"
+check "status reports the connection" python3 -I -c "import json,sys; s=json.loads(sys.argv[1]); assert s['connected'] and s['version']=='1.5.5' and s['waiting_rows']==0 and s['dropped_total']>=1, s" "$(q 'select ezlogs.status()')"
 check "the table created before connect is tracked since" test "$(tracked public.pre_connect)" = 1
+echo "== 1.5.5: Security Advisor, credential names, a busy table"
+check "every ezlogs function pins its search_path (Advisor lint function_search_path_mutable)" test "$(q "select count(*) from pg_proc where pronamespace = 'ezlogs'::regnamespace and not exists (select 1 from unnest(coalesce(proconfig, '{}')) c where c like 'search_path=%')")" = 0
+check "credential names are left out" test "$(q "select bool_and(ezlogs.is_sensitive_key(k)) from unnest(array['webhook_url','slackWebhookUrl','database_url','DATABASE_URL','connection_string','dsn','sentry_dsn','jwt','access_key','aws_access_key_id','license_key','seed_phrase','invite_code','magic_link']) k")" = t
+check "ordinary names are still recorded" test "$(q "select bool_or(ezlogs.is_sensitive_key(k)) from unnest(array['key_results','cookies','webhooks','stripe_webhook_events','webhook_id','authorizations','title','status','sort_key','monkey','dsnap']) k")" = f
+psql "$DB" -X -q -c "begin; lock table public.items in access exclusive mode; select pg_sleep(6); commit;" >/dev/null 2>&1 &
+HOLDER=$!; sleep 1
+check "uninstall waits at most 2 s for a busy table and removes nothing" bash -c "out=\$(psql '$DB' -X -At -c 'select ezlogs.uninstall()' 2>&1); echo \"\$out\" | grep -q 'busy right now, so nothing was removed' && test \"\$(psql '$DB' -X -At -c \"select count(*) from pg_namespace where nspname='ezlogs'\")\" = 1"
+wait "$HOLDER"
 check "uninstall" q "select ezlogs.uninstall()"
 check "no triggers, no schema, no key, no job are left" test "$(q "select (select count(*) from pg_trigger where tgname like 'ezlogs\_capture%') + (select count(*) from pg_namespace where nspname='ezlogs') + (select count(*) from vault.secrets where name='ezlogs_ingest_key') + (select count(*) from cron.job where jobname='ezlogs-flush') + (select count(*) from pg_event_trigger where evtname='ezlogs_track_tables')")" = 0
 check "the app still writes after uninstall" q "insert into public.items(name) values ('after-uninstall')"

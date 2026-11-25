@@ -47,7 +47,7 @@ $code"
 }
 wait_until() { for _ in $(seq 1 "${2:-30}"); do eval "$1" && return 0; sleep 1; done; return 1; }
 outbox() { q "select count(*) from ezlogs.outbox"; }
-point_at_receiver() { q "CREATE OR REPLACE FUNCTION ezlogs.endpoint() RETURNS text LANGUAGE sql IMMUTABLE AS \$\$ SELECT '$ENDPOINT' \$\$" >/dev/null; }
+point_at_receiver() { q "CREATE OR REPLACE FUNCTION ezlogs.endpoint() RETURNS text LANGUAGE sql IMMUTABLE SET search_path = ezlogs, pg_temp AS \$\$ SELECT '$ENDPOINT' \$\$" >/dev/null; }
 triggers() { q "select coalesce(string_agg(tgname, ',' order by tgname), '') from pg_trigger where tgrelid = 'public.up_items'::regclass and tgname like 'ezlogs%'"; }
 writes() { for n in "$@"; do echo "insert into public.up_items(name) values ('$n');"; done | psql "$DB" -X -q -v ON_ERROR_STOP=1; }
 

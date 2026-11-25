@@ -12,7 +12,7 @@ it a fit for apps built with Lovable, Bolt, v0 or by hand.
 
 One paste, no code in your app:
 
-1. In EZLogs, open **Settings → API keys → Lovable · Bolt · v0** and press **Create install
+1. In EZLogs, open **Install & keys** (the menu behind your initials, top right), choose **Lovable · Bolt · v0**, and press **Create install
    code**. The code is this repository's [`sql/install.sql`](sql/install.sql) plus one
    `select ezlogs.connect('ezldb_…');` line carrying your database key.
 2. Paste it into your project's **SQL editor** and press **Run**:

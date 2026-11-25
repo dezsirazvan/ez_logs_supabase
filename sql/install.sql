@@ -1,5 +1,11 @@
 -- EZLogs for Supabase: the database records what changed, who did it, and ships it to EZLogs.
 --
+-- Your editor may warn that this contains DELETE or DROP. Every one of them touches only EZLogs'
+-- own things: its own waiting rows in the `ezlogs` schema (once EZLogs received them, or the oldest
+-- when too many wait), its own job's run history, older versions of its own functions, and (only if
+-- you run ezlogs.uninstall()) its own triggers, key and schema. Nothing here changes or deletes
+-- your app's data.
+--
 -- Apply once as a migration (Lovable, Bolt, the Supabase SQL editor, `supabase db push`).
 -- Re-applying upgrades in place and keeps anything still waiting to be sent.
 -- Then, once, in the SQL editor (NEVER in a migration: migrations end up in git):
@@ -103,6 +109,7 @@ END $$;
 -- stops with a message; run it again), so the app's writes never queue behind it for long.
 CREATE OR REPLACE FUNCTION ezlogs.ensure_column(tbl text, col text, def text) RETURNS void
   LANGUAGE plpgsql
+  SET search_path = ezlogs, pg_temp
 AS $$
 DECLARE
   prev text := current_setting('lock_timeout');
@@ -119,6 +126,7 @@ $$;
 
 CREATE OR REPLACE FUNCTION ezlogs.ensure_index(name text, ddl text) RETURNS void
   LANGUAGE plpgsql
+  SET search_path = ezlogs, pg_temp
 AS $$
 DECLARE
   prev text := current_setting('lock_timeout');
@@ -227,15 +235,15 @@ CREATE TABLE IF NOT EXISTS ezlogs.tx_marks (
 -- Constants
 -- ---------------------------------------------------------------------------------------
 
-CREATE OR REPLACE FUNCTION ezlogs.version() RETURNS text LANGUAGE sql IMMUTABLE AS $$ SELECT '1.5.4' $$;
+CREATE OR REPLACE FUNCTION ezlogs.version() RETURNS text LANGUAGE sql IMMUTABLE SET search_path = ezlogs, pg_temp AS $$ SELECT '1.5.5' $$;
 
 -- Where data goes. A constant, never a setting: nothing inside the database can point the
 -- capture at another host.
-CREATE OR REPLACE FUNCTION ezlogs.endpoint() RETURNS text LANGUAGE sql IMMUTABLE AS $$
+CREATE OR REPLACE FUNCTION ezlogs.endpoint() RETURNS text LANGUAGE sql IMMUTABLE SET search_path = ezlogs, pg_temp AS $$
   SELECT 'https://app.ezlogs.io/api/ingest/postgres'
 $$;
 
-CREATE OR REPLACE FUNCTION ezlogs.connected() RETURNS boolean LANGUAGE sql STABLE AS $$
+CREATE OR REPLACE FUNCTION ezlogs.connected() RETURNS boolean LANGUAGE sql STABLE SET search_path = ezlogs, pg_temp AS $$
   SELECT EXISTS (SELECT 1 FROM ezlogs.state WHERE one AND connected_at IS NOT NULL)
 $$;
 
@@ -247,19 +255,21 @@ $$;
 -- (sql/postgres/00_install.sql, ezlogs_is_sensitive_key); a test keeps them identical.
 CREATE OR REPLACE FUNCTION ezlogs.is_sensitive_key(k text) RETURNS boolean
   LANGUAGE sql IMMUTABLE
+  SET search_path = ezlogs, pg_temp
 AS $$
-  SELECT s ~ '(password|token|secret|api_key|credit_card|ssn|social_security|encrypted|private_key|public_key|signing_key|pem|cipher|nonce|salt|digest|signature|hmac|credential|passwd|passcode|apikey|card_number|cardnumber|cvv|cvc|verification_code|recovery_code|backup_code|one_time_code|login_code)'
-      OR lower(k) ~ '(password|token|secret|api_key|credit_card|ssn|social_security|encrypted|private_key|public_key|signing_key|pem|cipher|nonce|salt|digest|signature|hmac|credential|passwd|passcode|apikey|card_number|cardnumber|cvv|cvc|verification_code|recovery_code|backup_code|one_time_code|login_code)'
-      OR s ~ '(^|[^a-z0-9])(pin|otp|totp|iban|mfa|passphrase|jti)([^a-z0-9]|$)'
+  SELECT s ~ '(password|token|secret|api_key|credit_card|ssn|social_security|encrypted|private_key|public_key|signing_key|pem|cipher|nonce|salt|digest|signature|hmac|credential|passwd|passcode|apikey|card_number|cardnumber|cvv|cvc|verification_code|recovery_code|backup_code|one_time_code|login_code|jwt|webhook_url|connection_string|database_url|access_key|auth_key|session_key|license_key|encryption_key|ssh_key|master_key|mnemonic|seed_phrase|auth_code|reset_code|invite_code|magic_link)'
+      OR lower(k) ~ '(password|token|secret|api_key|credit_card|ssn|social_security|encrypted|private_key|public_key|signing_key|pem|cipher|nonce|salt|digest|signature|hmac|credential|passwd|passcode|apikey|card_number|cardnumber|cvv|cvc|verification_code|recovery_code|backup_code|one_time_code|login_code|jwt|webhook_url|connection_string|database_url|access_key|auth_key|session_key|license_key|encryption_key|ssh_key|master_key|mnemonic|seed_phrase|auth_code|reset_code|invite_code|magic_link)'
+      OR s ~ '(^|[^a-z0-9])(pin|otp|totp|iban|mfa|passphrase|jti|dsn)([^a-z0-9]|$)'
     FROM (SELECT lower(regexp_replace(k, '([a-z0-9])([A-Z])', '\1_\2', 'g')) AS s) AS words
 $$;
 
 -- Bump whenever is_sensitive_key changes: triggers attached under another version fall back
 -- to checking every key and are re-attached by the next reconcile.
-CREATE OR REPLACE FUNCTION ezlogs.patterns_version() RETURNS text LANGUAGE sql IMMUTABLE AS $$ SELECT 'p2' $$;
+CREATE OR REPLACE FUNCTION ezlogs.patterns_version() RETURNS text LANGUAGE sql IMMUTABLE SET search_path = ezlogs, pg_temp AS $$ SELECT 'p3' $$;
 
 CREATE OR REPLACE FUNCTION ezlogs.strip_sensitive(r jsonb) RETURNS jsonb
   LANGUAGE sql IMMUTABLE
+  SET search_path = ezlogs, pg_temp
 AS $$
   SELECT CASE WHEN r IS NULL THEN NULL ELSE COALESCE(
     (SELECT jsonb_object_agg(key, value) FROM jsonb_each(r) WHERE NOT ezlogs.is_sensitive_key(key)),
@@ -269,21 +279,24 @@ $$;
 -- A value too big to record: its size instead (never walked, never sent).
 CREATE OR REPLACE FUNCTION ezlogs.size_marker(v jsonb) RETURNS jsonb
   LANGUAGE sql IMMUTABLE
+  SET search_path = ezlogs, pg_temp
 AS $$ SELECT to_jsonb(format('[%s bytes, not recorded]', octet_length(v::text))) $$;
 
 -- The same note from a stored size (pg_column_size), so a large value is never read.
 CREATE OR REPLACE FUNCTION ezlogs.size_note(bytes int) RETURNS jsonb
   LANGUAGE sql IMMUTABLE
+  SET search_path = ezlogs, pg_temp
 AS $$ SELECT to_jsonb(format('[%s bytes, not recorded]', bytes)) $$;
 
 -- More rows than this in one statement are recorded as one bulk row (the server reads it as one
 -- bulk step, like Rails' update_all), never one row each.
-CREATE OR REPLACE FUNCTION ezlogs.bulk_threshold() RETURNS int LANGUAGE sql IMMUTABLE AS $$ SELECT 100 $$;
+CREATE OR REPLACE FUNCTION ezlogs.bulk_threshold() RETURNS int LANGUAGE sql IMMUTABLE SET search_path = ezlogs, pg_temp AS $$ SELECT 100 $$;
 
 -- Whether capture is paused (see state). begin_capture reads the flag itself since 1.5.3; kept for a
 -- begin_capture from an older version that still calls it while an upgrade runs.
 CREATE OR REPLACE FUNCTION ezlogs.capture_paused() RETURNS boolean
   LANGUAGE sql STABLE
+  SET search_path = ezlogs, pg_temp
 AS $$ SELECT EXISTS (SELECT 1 FROM ezlogs.state WHERE one AND capture_paused_at IS NOT NULL) $$;
 
 -- Called by every capture before it records: true to record, false while capture is paused or
@@ -321,6 +334,7 @@ $$;
 -- replaced by their size without being walked (a big json document must not slow the write).
 CREATE OR REPLACE FUNCTION ezlogs.strip_nested(j jsonb, depth int DEFAULT 0) RETURNS jsonb
   LANGUAGE plpgsql IMMUTABLE
+  SET search_path = ezlogs, pg_temp
 AS $$
 BEGIN
   IF j IS NULL THEN
@@ -345,6 +359,7 @@ $$;
 -- their size: first values over 1 KB, then, if still over 24 KB, values over 128 bytes.
 CREATE OR REPLACE FUNCTION ezlogs.cap_values(r jsonb, max_bytes int) RETURNS jsonb
   LANGUAGE sql IMMUTABLE
+  SET search_path = ezlogs, pg_temp
 AS $$
   SELECT jsonb_object_agg(key, CASE WHEN octet_length(value::text) > max_bytes THEN ezlogs.size_marker(value)
                                     ELSE value END)
@@ -353,6 +368,7 @@ $$;
 
 CREATE OR REPLACE FUNCTION ezlogs.cap_size(r jsonb) RETURNS jsonb
   LANGUAGE plpgsql IMMUTABLE
+  SET search_path = ezlogs, pg_temp
 AS $$
 BEGIN
   IF r IS NULL OR pg_column_size(r) <= 16384 THEN
@@ -538,6 +554,7 @@ $$;
 -- replaced by their size, and a row that still would not fit in a post replaced by a note.
 CREATE OR REPLACE FUNCTION ezlogs.finish_row(j jsonb, jcols text[]) RETURNS jsonb
   LANGUAGE plpgsql IMMUTABLE
+  SET search_path = ezlogs, pg_temp
 AS $$
 DECLARE
   col text;
@@ -565,6 +582,7 @@ $$;
 -- name columns); nothing (NULLs) when nothing changed.
 CREATE OR REPLACE FUNCTION ezlogs.diff_rows(old_j jsonb, new_j jsonb, keep text[], OUT old_out jsonb, OUT new_out jsonb)
   LANGUAGE plpgsql IMMUTABLE
+  SET search_path = ezlogs, pg_temp
 AS $$
 DECLARE
   keys text[];
@@ -582,12 +600,13 @@ $$;
 
 -- An update over this many rows is recorded with its row count only: summarising every column of
 -- every row would add seconds to a very large statement (and to the app's statement timeout).
-CREATE OR REPLACE FUNCTION ezlogs.bulk_summary_max() RETURNS int LANGUAGE sql IMMUTABLE AS $$ SELECT 10000 $$;
+CREATE OR REPLACE FUNCTION ezlogs.bulk_summary_max() RETURNS int LANGUAGE sql IMMUTABLE SET search_path = ezlogs, pg_temp AS $$ SELECT 10000 $$;
 
 -- The equality operator of a type, schema-qualified (pgvector's and citext's live outside
 -- pg_catalog, and capture runs with search_path = ezlogs); NULL when the type has none.
 CREATE OR REPLACE FUNCTION ezlogs.eq_op(typ oid) RETURNS text
   LANGUAGE sql STABLE
+  SET search_path = ezlogs, pg_temp
 AS $$
   -- The type's own, else the one of a type it converts to without change (varchar uses text's).
   SELECT format('OPERATOR(%I.=)', n.nspname)
@@ -605,6 +624,7 @@ $$;
 -- box by area, interval '1 day' and '24 hours', citext by case). Binary types use their own equality.
 CREATE OR REPLACE FUNCTION ezlogs.changed_expr(col text, typ oid) RETURNS text
   LANGUAGE sql STABLE
+  SET search_path = ezlogs, pg_temp
 AS $$
   SELECT CASE WHEN (SELECT typname FROM pg_type WHERE oid = typ) IN ('bytea', 'vector', 'halfvec', 'sparsevec')
                    AND ezlogs.eq_op(typ) IS NOT NULL
@@ -622,6 +642,7 @@ CREATE OR REPLACE FUNCTION ezlogs.capture_source(op text, tbl text, pk text, pk_
                                                  summary text)
   RETURNS text
   LANGUAGE plpgsql IMMUTABLE
+  SET search_path = ezlogs, pg_temp
 AS $$
 DECLARE
   tr      text := CASE op WHEN 'DELETE' THEN 'o' ELSE 'n' END;   -- the transition table read
@@ -712,6 +733,7 @@ DROP FUNCTION IF EXISTS ezlogs.storage_object_view(storage.objects);
 -- break the install or the capture (a missing column is simply absent).
 CREATE OR REPLACE FUNCTION ezlogs.auth_user_view(j jsonb) RETURNS jsonb
   LANGUAGE sql IMMUTABLE
+  SET search_path = ezlogs, pg_temp
 AS $$
   SELECT jsonb_strip_nulls(jsonb_build_object(
     'id',                 j->'id',
@@ -784,6 +806,7 @@ $$;
 -- uploader is owner_id.
 CREATE OR REPLACE FUNCTION ezlogs.storage_object_view(j jsonb) RETURNS jsonb
   LANGUAGE sql IMMUTABLE
+  SET search_path = ezlogs, pg_temp
 AS $$
   SELECT jsonb_strip_nulls(jsonb_build_object(
     'id',         j->'id',
@@ -825,6 +848,7 @@ $$;
 -- are the secrets: `api_tokens`, `user_secrets`). A person can still track them.
 CREATE OR REPLACE FUNCTION ezlogs.skipped(table_name text) RETURNS boolean
   LANGUAGE sql IMMUTABLE
+  SET search_path = ezlogs, pg_temp
 AS $$
   SELECT table_name ~ '^(ezlogs_audit_log|_prisma_migrations|schema_migrations|ar_internal_metadata)$'
       OR table_name ~ '^(pg_|_litestream|solid_(queue|cache|cable)|active_storage_)'
@@ -836,6 +860,7 @@ $$;
 -- row trigger fires only for its own table's rows, so every row is recorded once, under its table.
 CREATE OR REPLACE FUNCTION ezlogs.in_inheritance(target regclass) RETURNS boolean
   LANGUAGE sql STABLE
+  SET search_path = ezlogs, pg_temp
 AS $$
   SELECT EXISTS (SELECT 1 FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid
                   WHERE (i.inhparent = target OR i.inhrelid = target) AND NOT c.relispartition)
@@ -866,10 +891,12 @@ $$;
 -- `<record>number` column in that form: the same rules as EventIngest::PostgresRows#singular_norm.
 CREATE OR REPLACE FUNCTION ezlogs.name_norm(name text) RETURNS text
   LANGUAGE sql IMMUTABLE
+  SET search_path = ezlogs, pg_temp
 AS $$ SELECT lower(replace(name, '_', '')) $$;
 
 CREATE OR REPLACE FUNCTION ezlogs.numbered_norm(table_name text) RETURNS text
   LANGUAGE sql IMMUTABLE
+  SET search_path = ezlogs, pg_temp
 AS $$
   SELECT CASE WHEN t ~ 'ies$' THEN left(t, -3) || 'y'
               WHEN t ~ '(ss|us|is)$' THEN t
@@ -1288,6 +1315,7 @@ CREATE OR REPLACE FUNCTION ezlogs.attach_platform() RETURNS void
   LANGUAGE plpgsql
   SECURITY DEFINER
   SET search_path = ezlogs, pg_temp
+  SET lock_timeout = '2s'   -- a busy table is skipped (retried later), so sign-ins never queue behind us
 AS $$
 BEGIN
   -- Each table on its own: one that can't be tracked now never undoes the others.
@@ -1337,6 +1365,7 @@ $$;
 -- a string or a number, trimmed, never empty; at most 120 characters.
 CREATE OR REPLACE FUNCTION ezlogs.name_value(v jsonb) RETURNS text
   LANGUAGE sql IMMUTABLE
+  SET search_path = ezlogs, pg_temp
 AS $$
   SELECT CASE WHEN jsonb_typeof(v) IN ('string', 'number') THEN NULLIF(left(btrim(v #>> '{}'), 120), '') END
 $$;
@@ -1346,6 +1375,7 @@ $$;
 -- Summary::Headline::CONTEXT_FK_SKIP (test/run.sh keeps the two lists the same), and `people`.
 CREATE OR REPLACE FUNCTION ezlogs.people_table(table_name text) RETURNS boolean
   LANGUAGE sql IMMUTABLE
+  SET search_path = ezlogs, pg_temp
 AS $$
   SELECT EXISTS (SELECT 1 FROM unnest(ARRAY[table_name, regexp_replace(table_name, '^.*_', '')]) n
                   WHERE left(ezlogs.numbered_norm(n), -6)
@@ -1650,6 +1680,7 @@ END $$;
 -- One outbox row as it is posted (send_batch measures and sends exactly this).
 CREATE OR REPLACE FUNCTION ezlogs.row_json(o ezlogs.outbox) RETURNS jsonb
   LANGUAGE sql STABLE
+  SET search_path = ezlogs, pg_temp
 AS $$
   SELECT jsonb_build_object(
     'id', o.id, 'schema', o.schema_name, 'table', o.table_name, 'op', o.op,
@@ -1981,17 +2012,19 @@ BEGIN
   --    the table locks attaching takes are held only until this run commits, a moment later; its
   --    own block, so a failure never undoes the steps above.
   IF st.last_reconciled IS NULL OR st.last_reconciled < clock_timestamp() - interval '10 minutes' THEN
-    BEGIN
-      PERFORM ezlogs.reconcile();
-    EXCEPTION WHEN others THEN
-      RAISE WARNING '[ezlogs] attaching tables failed (retried next run): %', SQLERRM;
-    END;
+    -- The run history first: cron.job_run_details has no index on jobid, so this reads the whole
+    -- table, and must not do it while this run holds the locks attaching takes.
     BEGIN
       DELETE FROM cron.job_run_details
        WHERE jobid IN (SELECT jobid FROM cron.job WHERE jobname = 'ezlogs-flush')
          AND end_time < now() - interval '1 hour';
     EXCEPTION WHEN others THEN
       NULL;
+    END;
+    BEGIN
+      PERFORM ezlogs.reconcile();
+    EXCEPTION WHEN others THEN
+      RAISE WARNING '[ezlogs] attaching tables failed (retried next run): %', SQLERRM;
     END;
   END IF;
 
@@ -2028,7 +2061,7 @@ DECLARE
   secret_id uuid;
 BEGIN
   IF p_key IS NULL OR p_key !~ '^ezldb_[A-Za-z0-9_-]{20,}$' THEN
-    RAISE EXCEPTION 'That is not an EZLogs database key (they start with ezldb_). Copy the install code from EZLogs: Settings, API keys, the Lovable · Bolt · v0 tab. A key that starts with ezl_ is for the Rails or Next.js agent, not for a database.';
+    RAISE EXCEPTION 'That is not an EZLogs database key (they start with ezldb_). Copy the install code from EZLogs: Install & keys, Lovable · Bolt · v0, Create install code. A key that starts with ezl_ is for the Rails or Next.js agent, not for a database.';
   END IF;
   IF to_regclass('vault.secrets') IS NULL THEN
     RAISE EXCEPTION 'Supabase Vault is not installed in this database; EZLogs keeps its key there.';
@@ -2122,10 +2155,17 @@ CREATE OR REPLACE FUNCTION ezlogs.uninstall() RETURNS text
   LANGUAGE plpgsql
   SECURITY DEFINER
   SET search_path = ezlogs, pg_temp
+  SET lock_timeout = '2s'   -- never let the app's queries queue behind a table someone holds
 AS $$
 DECLARE
   r record;
 BEGIN
+  -- The job's run history first: that delete reads the whole table, before any app table is locked.
+  BEGIN
+    DELETE FROM cron.job_run_details WHERE jobid IN (SELECT jobid FROM cron.job WHERE jobname = 'ezlogs-flush');
+  EXCEPTION WHEN others THEN
+    NULL;   -- no pg_cron, or no right to it: nothing of ours there
+  END;
   FOR r IN SELECT DISTINCT tgrelid::regclass AS rel FROM pg_trigger
             WHERE tgname LIKE 'ezlogs\_capture%' AND NOT tgisinternal AND tgparentid = 0 LOOP   -- clones go with their parent
     PERFORM ezlogs.detach(r.rel);
@@ -2136,7 +2176,9 @@ BEGIN
   END IF;
   DELETE FROM vault.secrets WHERE name = 'ezlogs_ingest_key';
   DROP SCHEMA ezlogs CASCADE;
-  RETURN 'EZLogs removed: triggers, job, key and the ezlogs schema are gone.';
+  RETURN 'EZLogs removed: triggers, job, key and the ezlogs schema are gone. Your data is untouched. pg_cron and pg_net stay enabled (other features may use them).';
+EXCEPTION WHEN lock_not_available THEN
+  RAISE EXCEPTION '[ezlogs] one of your tables is busy right now, so nothing was removed. Run select ezlogs.uninstall(); again in a moment.';
 END;
 $$;
 

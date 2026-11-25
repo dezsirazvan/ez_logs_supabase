@@ -49,7 +49,7 @@ workloads() {
 }
 
 psql "$DB" -X -q -v ON_ERROR_STOP=1 -f "$INSTALL" >/dev/null
-q "CREATE OR REPLACE FUNCTION ezlogs.endpoint() RETURNS text LANGUAGE sql IMMUTABLE AS \$\$ SELECT 'http://ezlogs-load-receiver:$PORT/api/ingest/postgres' \$\$" >/dev/null
+q "CREATE OR REPLACE FUNCTION ezlogs.endpoint() RETURNS text LANGUAGE sql IMMUTABLE SET search_path = ezlogs, pg_temp AS \$\$ SELECT 'http://ezlogs-load-receiver:$PORT/api/ingest/postgres' \$\$" >/dev/null
 BASE=$(workloads "without")
 q "select ezlogs.connect('ezldb_$(python3 -c 'import secrets;print(secrets.token_urlsafe(32))')', 'https://local-load.supabase.co')" >/dev/null
 q "select ezlogs.attach('public.load_items'::regclass); select ezlogs.attach('public.load_docs'::regclass)" >/dev/null 2>&1
