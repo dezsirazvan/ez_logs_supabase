@@ -1,5 +1,39 @@
 # Changelog
 
+## 1.6.0
+
+- **Phone numbers, addresses, birth dates, IP addresses and identity-document numbers never leave
+  the database.** A change to one is still sent, without its values, so EZLogs reads "Ana changed
+  her phone" (or "set", "removed"), never the number. The same rule runs on the EZLogs server
+  (which masks these on arrival for older installs too), in the Rails agent 0.2.24 and in
+  ezlogs-nextjs 0.4.18, checked against one shared list of column names
+  (`test/personal_key_vectors.json`):
+  - **By name** (`ezlogs.is_personal_key`): a column or json key with the word `phone`,
+    `telephone`, `mobile` (alone or as a number), `fax`, `msisdn`, `address` (not `email_address`),
+    `addr`, `street`, `line1`…, `house_number`, `postcode` / `postal_code` / `zip` / `zip_code`,
+    `birth` / `birthday` / `born` / `dob`, `passport`, `ip` / `ips` / `ipv4` / `ipv6` /
+    `remote_addr` / `forwarded_for`, `latitude` / `longitude` / `lat` / `lng`, or a tax, VAT,
+    national, ID-card, document, fiscal or driver's licence number. Not a column that ends in `id`,
+    `ids`, `uuid`, `type`, `kind`, `count`, `at`, `status`, `state`, `verified` or `confirmed`
+    (`address_id`, `phone_confirmed_at`, `phone_status` stay), nor one naming an email (unless a
+    phone shares it: `email_or_phone`). `auth.users`' `phone` too.
+  - **By table** (`ezlogs.is_personal_table`): a table that is a list of phones, addresses or IPs
+    (`phone_numbers`, `user_addresses`) has its value columns treated the same way (its `number` is
+    the phone), its rows are never named by their values, and its pre-install names are not sent.
+  - **Values** become `[redacted]`; `null`, blank strings and booleans are kept. In an update, a
+    personal value that did not change is left out of both sides, so two masked sides always mean
+    it changed; inside json values, the same at every depth. A bulk update's summary says a personal
+    column `{"changed": true}`, never its value.
+  - **Where:** as each row is sent (`ezlogs.row_json`). Capture is unchanged: the raw value sits only
+    in this database's own `ezlogs.outbox` until its row is sent, and no table re-attaches on upgrade.
+    A post is now sized from the rows as captured (`ezlogs.row_bytes`) and masked only for the rows it
+    sends; one that grew past the limit sends half its rows.
+  - `ezlogs.name_records` refuses a personal column ("holds personal data"); one chosen with an
+    earlier version is no longer sent, and those rows are named by their default columns again.
+  What this costs, on purpose: a business's own address or phone (a venue's street) is hidden too,
+  since the rule reads names, not intent; searching EZLogs for a phone number finds nothing. Leave
+  out more with `ezlogs.ignore_columns` or `ezlogs.untrack`; there is no switch to send these values.
+
 ## 1.5.5
 
 - **More credential names are never sent.** A column (or a key inside json) whose name contains

@@ -62,7 +62,7 @@ assert a and a == b, (a, b)"
 echo "== setup: a small app (tables, RLS, a storage bucket)"
 q "select ezlogs.uninstall()" >/dev/null 2>&1
 psql "$DB" -X -q -v ON_ERROR_STOP=1 <<'SQL' || { echo "app setup failed"; exit 1; }
-DROP TABLE IF EXISTS public.items, public.feedback, public.later_table, public.pre_connect, public.api_tokens, public.wide, public.invoices, public.bills, public."order-items", public.docs15, public.bulk15, public.pairs15, public.vars15, public.keys15, public.orders15, public.purchases15, public.emb15, public.part15, public.pairs16, public.boxes, public.huge15, public.orphan15, public.schema_migrations_x, public.ar_internal_metadata, public.alias15, public.defer15, public.vc15, public.solo15, public.parent15, public.plain15, public.app_secrets15, public.stale15, public.big15, public.types15, public.ren16, public.inh16_child, public.inh16, public.inh17_child, public.inh17, public.bookings154, public.classes154, public.profiles154, public.contacts154, public.members, public.team_members, public.coach_bios154, public.athletes154 CASCADE;
+DROP TABLE IF EXISTS public.items, public.feedback, public.later_table, public.pre_connect, public.api_tokens, public.wide, public.invoices, public.bills, public."order-items", public.docs15, public.bulk15, public.pairs15, public.vars15, public.keys15, public.orders15, public.purchases15, public.emb15, public.part15, public.pairs16, public.boxes, public.huge15, public.orphan15, public.schema_migrations_x, public.ar_internal_metadata, public.alias15, public.defer15, public.vc15, public.solo15, public.parent15, public.plain15, public.app_secrets15, public.stale15, public.big15, public.types15, public.ren16, public.inh16_child, public.inh16, public.inh17_child, public.inh17, public.bookings154, public.classes154, public.profiles154, public.contacts154, public.members, public.team_members, public.coach_bios154, public.athletes154, public.contacts16, public.phone_numbers CASCADE;
 CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA extensions;
 CREATE TABLE public.items (id bigserial PRIMARY KEY, name text UNIQUE NOT NULL, secret_token text,
                            settings jsonb, notes text, pairs jsonb[], created_by uuid DEFAULT auth.uid());
@@ -237,7 +237,7 @@ expect "an upload names the file and its owner" "
 o=[r for r in rows if r['schema']=='storage' and r['op']=='INSERT'][0]['new']
 assert o['bucket_id']=='files' and o['name'].startswith('$USER_ID/brief-') and o['owner_id']=='$USER_ID' and o['mimetype']=='text/plain', o"
 expect "every post names the install and the version" "
-assert all(p['version']=='1.5.5' and p['install_id'] and p['supabase_url']=='https://local-test.supabase.co' for p in posts)"
+assert all(p['version']=='1.6.0' and p['install_id'] and p['supabase_url']=='https://local-test.supabase.co' for p in posts)"
 check "the key travels only in the Authorization header" python3 -I -c "
 import json
 for l in open('$LOG'):
@@ -800,9 +800,59 @@ q "select ezlogs.connect('$KEY')" >/dev/null
 wait_until "[ \"\$(outbox)\" = 0 ]" 30
 check "an upgrade sends the sessions still valid again (EZLogs keeps one per id)" test "$(outbox)" = 0
 
+echo "== 1.6.0: personal fields never leave the database"
+check "the same personal column names as the server and both agents (shared list)" python3 -I -c "
+import json, subprocess, sys
+v = json.load(open('$HERE/personal_key_vectors.json'))
+keys = v['personal'] + v['not_personal']
+sql = 'select json_agg(ezlogs.is_personal_key(k) order by n) from unnest(%s::text[]) with ordinality t(k, n)' % (\"'{\" + ','.join('\"' + k + '\"' for k in keys) + \"}'\")
+got = json.loads(subprocess.check_output(['psql', '$DB', '-X', '-At', '-c', sql]))
+want = [True] * len(v['personal']) + [False] * len(v['not_personal'])
+bad = [k for k, g, w in zip(keys, got, want) if g != w]
+assert not bad, bad"
+check "a list of phones or addresses is personal, a table that only mentions one is not" test "$(q "select string_agg(t || '=' || ezlogs.is_personal_table(t), ',' order by t) from unnest(array['phone_numbers','user_addresses','phone_calls','address_books','orders']) t")" = "address_books=false,orders=false,phone_calls=false,phone_numbers=true,user_addresses=true"
+q "create table public.contacts16 (id bigserial primary key, name text, email text, phone text, street_address text, phone_verified boolean, city text, profile jsonb);
+   create table public.phone_numbers (id bigserial primary key, number text, label text, contact_id bigint, verified_at timestamptz);
+   grant all on public.contacts16, public.phone_numbers to service_role;" >/dev/null
+wait_until "[ \"\$(tracked public.contacts16)\" = 1 ] && [ \"\$(tracked public.phone_numbers)\" = 1 ]" 10
+q "insert into public.contacts16 (name, email, phone, street_address, phone_verified, city, profile) values ('Ana', 'ana@x.io', '0721 000 333', 'Main 4', false, 'Cluj', '{\"mobile\": \"0722\", \"plan\": \"pro\"}')" >/dev/null
+q "update public.contacts16 set phone = '0721 999 111', city = 'Iasi' where name = 'Ana'" >/dev/null
+q "update public.contacts16 set city = 'Brasov' where name = 'Ana'" >/dev/null
+q "update public.contacts16 set profile = '{\"mobile\": \"0733\", \"plan\": \"pro\"}', phone_verified = true where name = 'Ana'" >/dev/null
+q "update public.contacts16 set phone = '' where name = 'Ana'" >/dev/null
+q "insert into public.phone_numbers (number, label, contact_id) values ('0721 000 333', 'Home', 1)" >/dev/null
+q "insert into public.contacts16 (name, phone) select 'C' || g, '07' || g from generate_series(1, 150) g" >/dev/null
+q "update public.contacts16 set phone = '0700 000 000' where name like 'C%'" >/dev/null
+q "delete from public.contacts16 where name = 'Ana'" >/dev/null
+wait_until "[ \"\$(outbox)\" = 0 ]" 30
+expect "no phone, address or other personal value was sent" "
+sent = json.dumps([r for r in rows if r['table'] in ('contacts16', 'phone_numbers')])
+assert not any(s in sent for s in ('0721', '0722', '0733', '0700', 'Main 4', '\"07')), sent"
+expect "a new row keeps its email, booleans and other columns; its personal values are masked" "
+i=[r for r in rows if r['table']=='contacts16' and r['op']=='INSERT' and r['new'] and r['new'].get('name')=='Ana'][0]['new']
+assert i['phone']=='[redacted]' and i['street_address']=='[redacted]' and i['email']=='ana@x.io' and i['phone_verified'] is False and i['city']=='Cluj', i
+assert i['profile']=={'mobile': '[redacted]', 'plan': 'pro'}, i"
+expect "a personal change is sent masked on both sides; an unchanged one is left out of both" "
+u=[r for r in rows if r['table']=='contacts16' and r['op']=='UPDATE' and r.get('new')]
+assert u[0]['old']['phone']=='[redacted]' and u[0]['new']['phone']=='[redacted]' and u[0]['new']['city']=='Iasi', u[0]
+assert 'phone' not in u[1]['new'] and 'phone' not in u[1]['old'] and u[1]['new']['city']=='Brasov', u[1]
+assert u[2]['old']['profile']=={'mobile': '[redacted]', 'plan': 'pro'} and u[2]['new']['profile']=={'mobile': '[redacted]', 'plan': 'pro'} and u[2]['new']['phone_verified'] is True, u[2]
+assert u[3]['old']['phone']=='[redacted]' and u[3]['new']['phone']=='', u[3]"
+expect "a list of phones has its values masked, never its links or times" "
+p=[r for r in rows if r['table']=='phone_numbers'][0]['new']
+assert p['number']=='[redacted]' and p['label']=='[redacted]' and p['contact_id']==1, p"
+expect "a bulk update says a personal column changed, never the value" "
+b=[r for r in rows if r['table']=='contacts16' and r.get('bulk') and r['op']=='UPDATE']
+assert b and b[-1]['bulk']['columns']['phone']=={'changed': True}, b"
+expect "a deleted row's personal values are masked" "
+d=[r for r in rows if r['table']=='contacts16' and r['op']=='DELETE' and r.get('old')]
+assert d and d[-1]['old']['phone']=='' and d[-1]['old']['street_address']=='[redacted]', d[-1]"
+check "name_records refuses a personal column" bash -c "psql '$DB' -X -At -c \"select ezlogs.name_records('public.contacts16', 'phone')\" 2>&1 | grep -q 'holds personal data'"
+check "the raw values stay in this database's outbox only until sent (nothing waits)" test "$(outbox)" = 0
+
 echo "== status and uninstall"
-check "connect says which version is running" bash -c "psql '$DB' -X -At -c \"select ezlogs.connect('$KEY')\" | grep -q '^Connected (EZLogs 1.5.5)\. Now recording changes to '"
-check "status reports the connection" python3 -I -c "import json,sys; s=json.loads(sys.argv[1]); assert s['connected'] and s['version']=='1.5.5' and s['waiting_rows']==0 and s['dropped_total']>=1, s" "$(q 'select ezlogs.status()')"
+check "connect says which version is running" bash -c "psql '$DB' -X -At -c \"select ezlogs.connect('$KEY')\" | grep -q '^Connected (EZLogs 1.6.0)\. Now recording changes to '"
+check "status reports the connection" python3 -I -c "import json,sys; s=json.loads(sys.argv[1]); assert s['connected'] and s['version']=='1.6.0' and s['waiting_rows']==0 and s['dropped_total']>=1, s" "$(q 'select ezlogs.status()')"
 check "the table created before connect is tracked since" test "$(tracked public.pre_connect)" = 1
 echo "== 1.5.5: Security Advisor, credential names, a busy table"
 check "every ezlogs function pins its search_path (Advisor lint function_search_path_mutable)" test "$(q "select count(*) from pg_proc where pronamespace = 'ezlogs'::regnamespace and not exists (select 1 from unnest(coalesce(proconfig, '{}')) c where c like 'search_path=%')")" = 0

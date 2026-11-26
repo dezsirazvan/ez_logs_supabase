@@ -46,7 +46,7 @@ Lovable Cloud project, and the install enables them. Nothing is recorded until `
 | Where | What |
 |---|---|
 | every table in `public` | rows created, changed and deleted. A change carries what changed (before and after), plus the row's id and name columns. A statement over 100 rows (an import, a bulk update) is recorded as one bulk change: how many rows, and for an update of up to 10,000 rows which columns it set, with the value when every row got the same one. An update that changes primary keys is recorded as how many rows it changed. New tables are picked up automatically. |
-| `auth.users` | sign-ups, sign-ins, email confirmations, account changes. Only a fixed list of columns is read: never password hashes, tokens or metadata. |
+| `auth.users` | sign-ups, sign-ins, email confirmations, account changes. Only a fixed list of columns is read: never password hashes, tokens or metadata. The phone is masked like any personal value (1.6.0, below). |
 | `storage.objects` | files uploaded, replaced and deleted: bucket, name, size, type and owner |
 | names of rows that already exist (1.5.4) | once, after `connect`: for each table another table points to by a foreign key (the classes bookings point to), its rows' id and the one column EZLogs names them by (see [Names for records](#names-for-records)), nothing else. Left out: a table with one row per sign-in account (a foreign key to `auth.users` on a column unique on its own: profiles, a `user_id UNIQUE`), one named like people or accounts (members, customers, team_members, companies, …), and one with a column for a person's name, email or phone. A name list can't recognise every table of people: leave any table out with `select ezlogs.untrack('public.<table>');`. At most 1,000 rows per table (the highest keys) and 10,000 in all. EZLogs keeps them only to name those rows, from that moment on, until you delete your EZLogs account (activity itself is deleted after the retention period): they are never actions. Re-running the install or `connect` never sends them again. |
 
@@ -58,6 +58,24 @@ token's `iss`), so EZLogs can check logins reported by the browser against your 
 
 **Columns named like secrets** (password, token, secret, api_key, card number, cvv, pin, otp, …)
 are removed inside the database. They never leave it.
+
+**Personal values** (1.6.0): phone numbers, postal addresses (street, address lines, house
+number, postcode or zip), precise locations (latitude, longitude), birth dates, IP addresses and
+identity-document numbers (passport, national, tax or VAT id, ID card, driver's licence) are
+masked as each row is sent. A change to one is still recorded, without its values: EZLogs reads
+"changed the phone", "set the address", "removed the phone", never the number. The raw value only
+sits in `ezlogs.outbox`, in your own database, until the row is sent. The rule reads column names,
+the same one the Rails and Next.js agents and the EZLogs server use (the server also masks these
+on arrival from older installs, so they are never stored). Not masked: a column ending in `id`,
+`ids`, `uuid`, `type`, `kind`, `count`, `at`, `status`, `state`, `verified` or `confirmed`
+(`address_id`, `phone_confirmed_at`, `phone_status`), an email (`email`, `email_address`), and a
+null, blank or true/false value (`phone_verified: true`). A table that is itself a list of
+phones, addresses or IPs (`phone_numbers`, `user_addresses`) has its value columns treated as
+personal, and its rows are never named by their values. What this costs, on purpose: the rule
+reads names, not intent, so a business's own address or phone is hidden too; searching EZLogs for
+a phone number finds nothing; there is no switch to keep these values. Health or other
+special-category data can't be recognised by a column name: leave it out with
+`ezlogs.ignore_columns` (below).
 
 Large values are recorded as their size and never read: binary data, vectors (embeddings) and
 search columns always, and any other value stored over 8 KB. In a big row, values over about
@@ -135,7 +153,7 @@ A row is named by its own `name`, `title`, `number` or `label` column (or `<tabl
 same as the Rails and Next.js agents; a table with none shows its rows by their short id
 (`#b38a…a236`). `ezlogs.name_records('public.<table>', '<column>')` names any table's rows by
 another of its columns. For example, `ezlogs.name_records('public.invoices', 'reference')` makes
-EZLogs show "Updated invoice 'INV-0042'". It refuses a column named like a secret (never sent). It rebuilds
+EZLogs show "Updated invoice 'INV-0042'". It refuses a column named like a secret (never sent) and, from 1.6.0, a personal column ("holds personal data"). It rebuilds
 that table's capture once, so every change carries the name column. Never pick an email or a phone
 number: names show on shared links. In a migration, guard it so a copy of the project without
 EZLogs still applies:

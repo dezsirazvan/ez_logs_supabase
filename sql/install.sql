@@ -235,7 +235,7 @@ CREATE TABLE IF NOT EXISTS ezlogs.tx_marks (
 -- Constants
 -- ---------------------------------------------------------------------------------------
 
-CREATE OR REPLACE FUNCTION ezlogs.version() RETURNS text LANGUAGE sql IMMUTABLE SET search_path = ezlogs, pg_temp AS $$ SELECT '1.5.5' $$;
+CREATE OR REPLACE FUNCTION ezlogs.version() RETURNS text LANGUAGE sql IMMUTABLE SET search_path = ezlogs, pg_temp AS $$ SELECT '1.6.0' $$;
 
 -- Where data goes. A constant, never a setting: nothing inside the database can point the
 -- capture at another host.
@@ -274,6 +274,263 @@ AS $$
   SELECT CASE WHEN r IS NULL THEN NULL ELSE COALESCE(
     (SELECT jsonb_object_agg(key, value) FROM jsonb_each(r) WHERE NOT ezlogs.is_sensitive_key(key)),
     '{}'::jsonb) END
+$$;
+
+-- Personal fields (1.6.0): phone numbers, postal addresses, precise locations, birth dates, IP
+-- addresses and identity-document numbers. Their values never leave the database; a change to one
+-- still does ("changed the phone"). Captured rows keep them in ezlogs.outbox (this database), and
+-- ezlogs.row_json masks them as a row is sent. Same rule as the EZLogs server, the Rails agent and
+-- ezlogs-nextjs (one shared list of column names; test/run.sh checks it here).
+CREATE OR REPLACE FUNCTION ezlogs.personal_words(k text) RETURNS text[]
+  LANGUAGE plpgsql IMMUTABLE
+  SET search_path = ezlogs, pg_temp
+AS $$
+BEGIN
+  -- plpgsql (not sql): its plans are cached, and a send calls these for every key of every row.
+  RETURN array_remove(regexp_split_to_array(
+           lower(regexp_replace(regexp_replace(COALESCE(k, ''), '([A-Z]+)([A-Z][a-z])', '\1_\2', 'g'),
+                                '([a-z0-9])([A-Z])', '\1_\2', 'g')),
+           '[^a-z0-9]+'), '');
+END;
+$$;
+
+-- A key is personal by its words. Not a key ending in a link, a kind, a count, a time or a state
+-- (address_id, phone_confirmed_at, phone_status), nor one naming an email (unless a phone shares it).
+-- ezlogs.is_personal_key runs this only for a key holding one of the words' letters (most don't).
+CREATE OR REPLACE FUNCTION ezlogs.is_personal_key_words(k text) RETURNS boolean
+  LANGUAGE plpgsql IMMUTABLE
+  SET search_path = ezlogs, pg_temp
+AS $$
+DECLARE
+  w      text[] := ezlogs.personal_words(k);
+  joined text;
+  last   text;
+  phrase boolean;
+BEGIN
+  IF cardinality(w) = 0 THEN
+    RETURN false;
+  END IF;
+  joined := array_to_string(w, '_');
+  last := w[cardinality(w)];
+  phrase := joined ~ ('(^|_)((tax|vat|national|passport|id_card|id|document|personal|fiscal)_(id|number|no|code)'
+                      '|drivers?_licen[cs]e|national_insurance|social_insurance|fiscal_code|tax_code'
+                      '|(tel|cell|mobile)_(number|no|phone)|cell_phone|house_number|remote_addr|forwarded_for|post_code)(_|$)');
+  IF w && ARRAY['email', 'mail'] AND NOT w && ARRAY['phone', 'phones', 'mobile', 'telephone'] THEN
+    RETURN false;
+  END IF;
+  IF phrase AND NOT last = ANY(ARRAY['id', 'ids', 'uuid', 'type', 'kind', 'count', 'at', 'status', 'state', 'verified', 'confirmed']) THEN
+    RETURN true;
+  END IF;
+  IF joined ~ '(^|_)(tax|vat|national|passport|id_card)_(id|number|no)$' THEN
+    RETURN true;
+  END IF;
+  IF last = ANY(ARRAY['id', 'ids', 'uuid', 'type', 'kind', 'count', 'at', 'status', 'state', 'verified', 'confirmed']) THEN
+    RETURN false;
+  END IF;
+  RETURN w && ARRAY['phone', 'phones', 'phonenumber', 'telephone', 'cellphone', 'msisdn', 'fax', 'address', 'addresses',
+                    'addr', 'street', 'postcode', 'postal', 'zipcode', 'birth', 'birthday', 'birthdate', 'born', 'dob',
+                    'passport', 'ip', 'ips', 'ipv4', 'ipv6', 'latitude', 'longitude', 'lat', 'lng', 'geolocation']
+      OR EXISTS (SELECT 1 FROM unnest(w) x WHERE x ~ '^(phone|address|addr|line)[0-9]+$')
+      OR phrase
+      OR w IN (ARRAY['tel'], ARRAY['mobile'], ARRAY['cell'])
+      OR ('zip' = ANY(w) AND (cardinality(w) = 1 OR 'code' = ANY(w)));
+END;
+$$;
+
+-- Every personal key contains one of these (a necessary condition, never a sufficient one): a send
+-- reads every key of every row, and this keeps the word rule to the few that may be personal.
+CREATE OR REPLACE FUNCTION ezlogs.is_personal_key(k text) RETURNS boolean
+  LANGUAGE plpgsql IMMUTABLE
+  SET search_path = ezlogs, pg_temp
+AS $$
+BEGIN
+  RETURN lower(k) ~ ('phone|tel|cell|mobile|msisdn|fax|addr|street|post|zip|birth|born|dob|passport|ip|lat|lng|longitude'
+                     '|geolocation|line|tax|vat|national|id[^a-z0-9]*(card|number|no|code)|document|personal|fiscal|licen|insurance'
+                     '|house|forwarded')
+         AND ezlogs.is_personal_key_words(k);
+END;
+$$;
+
+-- A table that is a list of phones, addresses or IPs (user_addresses, phone_numbers), not one that
+-- only mentions one (phone_calls, address_books): its value columns are personal.
+CREATE OR REPLACE FUNCTION ezlogs.is_personal_table(t text) RETURNS boolean
+  LANGUAGE plpgsql IMMUTABLE
+  SET search_path = ezlogs, pg_temp
+AS $$
+DECLARE
+  w text[];
+  n int;
+BEGIN
+  -- Ends in one of the words (necessary, cheap) before the words are read.
+  IF lower(COALESCE(t, '')) !~ '(phones?|address|addresses|ips?|numbers?)[^a-z0-9]*$' THEN
+    RETURN false;
+  END IF;
+  w := ezlogs.personal_words(t);
+  n := cardinality(w);
+  RETURN n > 0 AND (w[n] = ANY(ARRAY['phone', 'phones', 'telephone', 'telephones', 'address', 'addresses', 'ip', 'ips'])
+                    OR (w[n] IN ('number', 'numbers') AND n > 1 AND w[n - 1] IN ('phone', 'telephone', 'mobile')));
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION ezlogs.is_personal_column(k text, t text) RETURNS boolean
+  LANGUAGE plpgsql IMMUTABLE
+  SET search_path = ezlogs, pg_temp
+AS $$
+DECLARE
+  w text[];
+BEGIN
+  IF ezlogs.is_personal_key(k) THEN
+    RETURN true;
+  END IF;
+  IF NOT ezlogs.is_personal_table(t) THEN
+    RETURN false;
+  END IF;
+  w := ezlogs.personal_words(k);
+  RETURN cardinality(w) > 0
+     AND NOT w[cardinality(w)] = ANY(ARRAY['id', 'ids', 'uuid', 'type', 'kind', 'count', 'at', 'status', 'state', 'verified', 'confirmed'])
+     AND NOT w && ARRAY['email', 'mail'];
+END;
+$$;
+
+-- Null, blank and booleans say nothing about the person ("removed the phone" stays readable).
+CREATE OR REPLACE FUNCTION ezlogs.mask_personal_value(v jsonb) RETURNS jsonb
+  LANGUAGE plpgsql IMMUTABLE
+  SET search_path = ezlogs, pg_temp
+AS $$
+BEGIN
+  IF v IS NULL OR jsonb_typeof(v) IN ('null', 'boolean') OR (jsonb_typeof(v) = 'string' AND btrim(v #>> '{}') = '') THEN
+    RETURN v;
+  END IF;
+  RETURN '"[redacted]"'::jsonb;
+END;
+$$;
+
+-- A value with every personal key inside it masked, at any depth.
+CREATE OR REPLACE FUNCTION ezlogs.mask_personal_nested(j jsonb, depth int DEFAULT 0) RETURNS jsonb
+  LANGUAGE plpgsql IMMUTABLE
+  SET search_path = ezlogs, pg_temp
+AS $$
+BEGIN
+  IF j IS NULL THEN
+    RETURN j;
+  ELSIF depth > 8 THEN
+    -- Deeper than anything captured keeps (strip_nested stops at 6): hidden whole, never sent unread.
+    RETURN CASE WHEN jsonb_typeof(j) IN ('object', 'array') THEN '"[redacted]"'::jsonb ELSE j END;
+  ELSIF jsonb_typeof(j) = 'object' THEN
+    RETURN COALESCE((SELECT jsonb_object_agg(key, CASE WHEN ezlogs.is_personal_key(key) THEN ezlogs.mask_personal_value(value)
+                                                       WHEN jsonb_typeof(value) IN ('object', 'array') THEN ezlogs.mask_personal_nested(value, depth + 1)
+                                                       ELSE value END)
+                       FROM jsonb_each(j)), '{}'::jsonb);
+  ELSIF jsonb_typeof(j) = 'array' THEN
+    RETURN COALESCE((SELECT jsonb_agg(CASE WHEN jsonb_typeof(value) IN ('object', 'array') THEN ezlogs.mask_personal_nested(value, depth + 1)
+                                           ELSE value END ORDER BY n)
+                       FROM jsonb_array_elements(j) WITH ORDINALITY AS a(value, n)), '[]'::jsonb);
+  END IF;
+  RETURN j;
+END;
+$$;
+
+-- The columns of a table that are personal, among the given keys (the keys a batch of rows holds):
+-- a send checks each table's columns once, not every key of every row.
+CREATE OR REPLACE FUNCTION ezlogs.personal_columns(tbl text, keys text[]) RETURNS text[]
+  LANGUAGE plpgsql IMMUTABLE
+  SET search_path = ezlogs, pg_temp
+AS $$
+BEGIN
+  RETURN COALESCE((SELECT array_agg(k) FROM unnest(keys) k WHERE ezlogs.is_personal_column(k, tbl)), '{}');
+END;
+$$;
+
+-- A row's two images (either may be null) with personal values masked. An update's personal value
+-- that did not change leaves both sides, one that did is masked on each, so two masked sides always
+-- mean it changed (the server reads them so). pcols: the row's personal columns
+-- (ezlogs.personal_columns); inside json values only key names count (ezlogs.is_personal_key).
+-- Only personal columns and json values are touched: every other value is copied as it is.
+CREATE OR REPLACE FUNCTION ezlogs.mask_personal_pair(old_j jsonb, new_j jsonb, pcols text[], depth int DEFAULT 0,
+                                                     OUT old_out jsonb, OUT new_out jsonb)
+  LANGUAGE plpgsql IMMUTABLE
+  SET search_path = ezlogs, pg_temp
+AS $$
+DECLARE
+  k    text;
+  a    jsonb;
+  b    jsonb;
+  pair record;
+BEGIN
+  -- Most rows: no personal column and no json value (read from the text: a '{' after the first
+  -- character or any '[' may be one; a string holding one only takes the longer way).
+  IF depth = 0 AND COALESCE(cardinality(pcols), 0) = 0
+     AND (old_j IS NULL OR (strpos(substr(old_j::text, 2), '{') = 0 AND strpos(old_j::text, '[') = 0))
+     AND (new_j IS NULL OR (strpos(substr(new_j::text, 2), '{') = 0 AND strpos(new_j::text, '[') = 0)) THEN
+    old_out := old_j;
+    new_out := new_j;
+    RETURN;
+  END IF;
+  IF jsonb_typeof(old_j) IS DISTINCT FROM 'object' OR jsonb_typeof(new_j) IS DISTINCT FROM 'object' OR depth > 8 THEN
+    -- One image (an insert, a delete), or values that are not both objects.
+    old_out := CASE WHEN depth = 0 THEN ezlogs.mask_personal_row(old_j, pcols) ELSE ezlogs.mask_personal_nested(old_j, depth) END;
+    new_out := CASE WHEN depth = 0 THEN ezlogs.mask_personal_row(new_j, pcols) ELSE ezlogs.mask_personal_nested(new_j, depth) END;
+    RETURN;
+  END IF;
+  old_out := old_j;
+  new_out := new_j;
+  FOR k IN SELECT key FROM jsonb_each(old_j) WHERE (depth = 0 AND key = ANY(pcols)) OR (depth > 0 AND ezlogs.is_personal_key(key))
+                                                   OR jsonb_typeof(value) IN ('object', 'array')
+           UNION
+           SELECT key FROM jsonb_each(new_j) WHERE (depth = 0 AND key = ANY(pcols)) OR (depth > 0 AND ezlogs.is_personal_key(key))
+                                                   OR jsonb_typeof(value) IN ('object', 'array') LOOP
+    a := old_j -> k;
+    b := new_j -> k;
+    IF (depth = 0 AND k = ANY(pcols)) OR (depth > 0 AND ezlogs.is_personal_key(k)) THEN
+      IF old_j ? k AND new_j ? k AND a = b THEN   -- it did not change: out of both sides
+        old_out := old_out - k;
+        new_out := new_out - k;
+      ELSE
+        IF old_j ? k THEN old_out := jsonb_set(old_out, ARRAY[k], ezlogs.mask_personal_value(a)); END IF;
+        IF new_j ? k THEN new_out := jsonb_set(new_out, ARRAY[k], ezlogs.mask_personal_value(b)); END IF;
+      END IF;
+    ELSE
+      SELECT * INTO pair FROM ezlogs.mask_personal_pair(a, b, NULL, depth + 1);
+      IF old_j ? k THEN old_out := jsonb_set(old_out, ARRAY[k], COALESCE(pair.old_out, 'null')); END IF;
+      IF new_j ? k THEN new_out := jsonb_set(new_out, ARRAY[k], COALESCE(pair.new_out, 'null')); END IF;
+    END IF;
+  END LOOP;
+END;
+$$;
+
+-- One row image (an insert's, a delete's) with its personal values masked.
+CREATE OR REPLACE FUNCTION ezlogs.mask_personal_row(j jsonb, pcols text[]) RETURNS jsonb
+  LANGUAGE plpgsql IMMUTABLE
+  SET search_path = ezlogs, pg_temp
+AS $$
+DECLARE
+  k text;
+  v jsonb;
+BEGIN
+  IF jsonb_typeof(j) IS DISTINCT FROM 'object' THEN
+    RETURN j;
+  END IF;
+  FOR k, v IN SELECT key, value FROM jsonb_each(j) WHERE key = ANY(pcols) OR jsonb_typeof(value) IN ('object', 'array') LOOP
+    j := jsonb_set(j, ARRAY[k], CASE WHEN k = ANY(pcols) THEN ezlogs.mask_personal_value(v) ELSE ezlogs.mask_personal_nested(v, 1) END);
+  END LOOP;
+  RETURN j;
+END;
+$$;
+
+-- A bulk update's summary: a personal column says it changed, never its value.
+CREATE OR REPLACE FUNCTION ezlogs.mask_personal_bulk(bulk jsonb, pcols text[]) RETURNS jsonb
+  LANGUAGE plpgsql IMMUTABLE
+  SET search_path = ezlogs, pg_temp
+AS $$
+BEGIN
+  IF jsonb_typeof(bulk -> 'columns') IS DISTINCT FROM 'object' THEN
+    RETURN bulk;
+  END IF;
+  RETURN jsonb_set(bulk, '{columns}', COALESCE((
+           SELECT jsonb_object_agg(key, CASE WHEN key = ANY(pcols) AND jsonb_typeof(value) NOT IN ('object', 'null')
+                                             THEN '{"changed": true}'::jsonb ELSE value END)
+             FROM jsonb_each(bulk -> 'columns')), '{}'::jsonb));
+END;
 $$;
 
 -- A value too big to record: its size instead (never walked, never sent).
@@ -1212,6 +1469,9 @@ BEGIN
   IF ezlogs.is_sensitive_key(column_name) THEN
     RAISE EXCEPTION 'ezlogs.name_records: % is named like a secret, so EZLogs never receives it and it can''t name rows', column_name;
   END IF;
+  IF ezlogs.is_personal_column(column_name, t::text) THEN
+    RAISE EXCEPTION 'ezlogs.name_records: % holds personal data (a phone, an address, …), which never leaves the database, so it can''t name rows', column_name;
+  END IF;
   INSERT INTO ezlogs.record_names (table_oid, column_name) VALUES (t, column_name)
     ON CONFLICT (table_oid) DO UPDATE SET column_name = EXCLUDED.column_name;
   PERFORM ezlogs.refresh_record_names();
@@ -1231,6 +1491,7 @@ AS $$
       FROM ezlogs.record_names r
       JOIN pg_class c ON c.oid = r.table_oid
       JOIN pg_namespace n ON n.oid = c.relnamespace
+     WHERE NOT ezlogs.is_personal_column(r.column_name, c.relname)   -- chosen before 1.6.0: never sent now
      ORDER BY 1 LIMIT 200) named;
 $$;
 
@@ -1424,6 +1685,7 @@ BEGIN
                            WHERE f.contype = 'f' AND f.confrelid = c.oid AND f.conrelid <> c.oid
                              AND r.relnamespace = 'public'::regnamespace)
               AND NOT ezlogs.people_table(c.relname)
+              AND NOT ezlogs.is_personal_table(c.relname)   -- a list of phones or addresses: named by them (1.6.0)
               -- one row per sign-in account: a foreign key to auth.users on a column unique on its own
               AND NOT EXISTS (SELECT 1 FROM pg_constraint f JOIN pg_index i ON i.indrelid = f.conrelid AND i.indisunique
                                WHERE f.contype = 'f' AND f.conrelid = c.oid AND f.confrelid = to_regclass('auth.users')
@@ -1452,6 +1714,7 @@ BEGIN
         FROM pg_attribute a LEFT JOIN ezlogs.record_names r ON r.table_oid = t.rel
        WHERE a.attrelid = t.rel AND a.attnum > 0 AND NOT a.attisdropped AND a.attname <> pk
          AND NOT ezlogs.is_sensitive_key(a.attname)
+         AND NOT ezlogs.is_personal_column(a.attname, t.relname)   -- a phone or an address never names a row (1.6.0)
          AND NOT a.attname = ANY(COALESCE((SELECT columns FROM ezlogs.ignored_columns WHERE table_oid = t.rel), '{}'))
          AND (ezlogs.name_norm(a.attname) IN ('name', 'title', 'number', 'label', ezlogs.numbered_norm(t.relname))
               OR a.attname = r.column_name);
@@ -1677,17 +1940,71 @@ END $$;
 -- rows and 48 KB of row data. pg_net (0.20) stalls on request bodies over ~64 KB (it sends the
 -- first 64 KB and waits until the timeout), so posts stay well under that. A transaction
 -- bigger than one post spans several; EZLogs joins its rows. The caller holds the state row.
--- One outbox row as it is posted (send_batch measures and sends exactly this).
-CREATE OR REPLACE FUNCTION ezlogs.row_json(o ezlogs.outbox) RETURNS jsonb
+-- The personal columns of each table among the rows a post sends: {table: [columns]}. Each
+-- distinct column is checked once per post, not once per row.
+CREATE OR REPLACE FUNCTION ezlogs.personal_map(ids bigint[]) RETURNS jsonb
+  LANGUAGE plpgsql STABLE
+  SET search_path = ezlogs, pg_temp
+AS $$
+BEGIN
+  RETURN COALESCE((
+    SELECT jsonb_object_agg(t, to_jsonb(ezlogs.personal_columns(t, keys)))
+      FROM (SELECT x.table_name AS t, array_agg(DISTINCT x.k) AS keys
+              FROM (SELECT o.table_name, k
+                      FROM (SELECT table_name, schema_name, old_row, new_row, bulk FROM ezlogs.outbox
+                             WHERE id = ANY(ids)) o
+                      CROSS JOIN LATERAL jsonb_object_keys(
+                        CASE WHEN jsonb_typeof(o.new_row) = 'object' THEN o.new_row ELSE '{}' END
+                        || CASE WHEN jsonb_typeof(o.old_row) = 'object' THEN o.old_row ELSE '{}' END
+                        || CASE WHEN jsonb_typeof(o.bulk -> 'columns') = 'object' THEN o.bulk -> 'columns' ELSE '{}' END) k
+                     WHERE o.schema_name <> 'ezlogs') x
+             GROUP BY x.table_name) y), '{}'::jsonb);
+END;
+$$;
+
+-- One outbox row as it is posted. personal: {table: [its personal columns]} for the rows being sent
+-- (ezlogs.personal_map).
+CREATE OR REPLACE FUNCTION ezlogs.row_json(o ezlogs.outbox, personal jsonb) RETURNS jsonb
   LANGUAGE sql STABLE
   SET search_path = ezlogs, pg_temp
 AS $$
+  -- Personal values are masked here, as the row leaves (ezlogs.mask_personal_pair); a pre-install
+  -- record name (schema ezlogs) is already a name, never a personal column (ezlogs.send_record_names).
+  SELECT jsonb_build_object(
+    'id', o.id, 'schema', o.schema_name, 'table', o.table_name, 'op', o.op,
+    'old', p.old_out, 'new', p.new_out, 'resource_id', o.resource_id,
+    'claims', o.claims, 'correlation_id', o.correlation_id, 'txid', o.txid,
+    'tx_started_at', o.tx_started_at, 'captured_at', o.captured_at)
+    || CASE WHEN o.row_count IS NOT NULL THEN jsonb_build_object('row_count', o.row_count, 'bulk', ezlogs.mask_personal_bulk(o.bulk, c.pcols)) ELSE '{}'::jsonb END
+    FROM (SELECT ARRAY(SELECT jsonb_array_elements_text(COALESCE(personal -> o.table_name, '[]'))) AS pcols) c
+    CROSS JOIN LATERAL ezlogs.mask_personal_pair(o.old_row, o.new_row, c.pcols) p
+   WHERE o.schema_name <> 'ezlogs'
+  UNION ALL
   SELECT jsonb_build_object(
     'id', o.id, 'schema', o.schema_name, 'table', o.table_name, 'op', o.op,
     'old', o.old_row, 'new', o.new_row, 'resource_id', o.resource_id,
     'claims', o.claims, 'correlation_id', o.correlation_id, 'txid', o.txid,
     'tx_started_at', o.tx_started_at, 'captured_at', o.captured_at)
-    || CASE WHEN o.row_count IS NOT NULL THEN jsonb_build_object('row_count', o.row_count, 'bulk', o.bulk) ELSE '{}'::jsonb END
+   WHERE o.schema_name = 'ezlogs'
+$$;
+
+-- A row's size as captured, to choose how many rows a post takes before any is serialised (its
+-- sent form, masked, is about the same; send_batch checks the post itself). Never sent.
+CREATE OR REPLACE FUNCTION ezlogs.row_bytes(o ezlogs.outbox) RETURNS int
+  LANGUAGE sql STABLE
+  SET search_path = ezlogs, pg_temp
+AS $$
+  SELECT 200 + octet_length(COALESCE(o.old_row::text, '')) + octet_length(COALESCE(o.new_row::text, ''))
+       + octet_length(COALESCE(o.claims::text, '')) + octet_length(COALESCE(o.bulk::text, ''))
+       + octet_length(COALESCE(o.resource_id, '')) + octet_length(COALESCE(o.correlation_id, ''))
+$$;
+
+-- 1.5.x's signature, for a send already running while this file is re-applied: masks too.
+CREATE OR REPLACE FUNCTION ezlogs.row_json(o ezlogs.outbox) RETURNS jsonb
+  LANGUAGE sql STABLE
+  SET search_path = ezlogs, pg_temp
+AS $$
+  SELECT ezlogs.row_json(o, ezlogs.personal_map(ARRAY[o.id]))
 $$;
 
 CREATE OR REPLACE FUNCTION ezlogs.send_batch() RETURNS int
@@ -1702,6 +2019,7 @@ DECLARE
   payload jsonb;
   rid     bigint;
   names   jsonb;
+  personal jsonb;
 BEGIN
   SELECT * INTO st FROM ezlogs.state WHERE one;
   IF st.connected_at IS NULL OR (st.paused_until IS NOT NULL AND st.paused_until > clock_timestamp()) THEN
@@ -1718,7 +2036,7 @@ BEGIN
   LOOP
     SELECT array_agg(id ORDER BY id) INTO ids FROM (
       SELECT c.id, c.bytes, sum(c.bytes) OVER (ORDER BY c.id) AS running
-        FROM (SELECT o.id, octet_length(ezlogs.row_json(o)::text) + 2 AS bytes
+        FROM (SELECT o.id, ezlogs.row_bytes(o) + 2 AS bytes
                 FROM ezlogs.outbox o WHERE o.request_id IS NULL ORDER BY o.id LIMIT 500) c) s
      WHERE s.running <= 49152 - octet_length(names::text);
     EXIT WHEN ids IS NOT NULL OR names = '{}'::jsonb;
@@ -1734,19 +2052,38 @@ BEGIN
     RETURN 0;
   END IF;
 
-  SELECT jsonb_build_object(
-           'install_id',   st.install_id,
-           'version',      ezlogs.version(),
-           'supabase_url', st.supabase_url,
-           'dropped_rows', st.dropped_total,
-           'names',        names,
-           -- About how many wait (ids run in order; read from the unsent index, never counted).
-           'waiting_rows', (SELECT COALESCE(max(id) - min(id) + 1, 0) FROM ezlogs.outbox WHERE request_id IS NULL),
-           'capture_paused', CASE WHEN st.capture_paused_at IS NOT NULL
-                                  THEN jsonb_build_object('since', st.capture_paused_at, 'reason', st.capture_paused_reason) END,
-           'rows', jsonb_agg(ezlogs.row_json(o) ORDER BY o.id))
-    INTO payload
-    FROM ezlogs.outbox o WHERE o.id = ANY(ids);
+  -- Personal values are masked only for the rows this post sends. A masked value can be a few bytes
+  -- longer than the one it hides: a post that grew past the limit sends half its rows (the rest
+  -- wait for the next post).
+  LOOP
+    personal := ezlogs.personal_map(ids);
+    SELECT jsonb_build_object(
+             'install_id',   st.install_id,
+             'version',      ezlogs.version(),
+             'supabase_url', st.supabase_url,
+             'dropped_rows', st.dropped_total,
+             'names',        names,
+             -- About how many wait (ids run in order; read from the unsent index, never counted).
+             'waiting_rows', (SELECT COALESCE(max(id) - min(id) + 1, 0) FROM ezlogs.outbox WHERE request_id IS NULL),
+             'capture_paused', CASE WHEN st.capture_paused_at IS NOT NULL
+                                    THEN jsonb_build_object('since', st.capture_paused_at, 'reason', st.capture_paused_reason) END,
+             'rows', jsonb_agg(ezlogs.row_json(o, personal) ORDER BY o.id))
+      INTO payload
+      FROM ezlogs.outbox o WHERE o.id = ANY(ids);
+    EXIT WHEN octet_length(payload::text) <= 53248 OR (cardinality(ids) = 1 AND names = '{}'::jsonb);
+    IF cardinality(ids) = 1 THEN
+      names := '{}'::jsonb;   -- one row: try it without the names before giving up on it
+    ELSE
+      ids := ids[1:cardinality(ids) / 2];
+    END IF;
+  END LOOP;
+  IF octet_length(payload::text) > 53248 THEN
+    -- One row still over the limit once masked (a long json of tiny personal values): dropped and
+    -- counted, as a row over the limit always was, rather than stall every post behind it.
+    WITH gone AS (DELETE FROM ezlogs.outbox WHERE id = ids[1] RETURNING 1)
+    UPDATE ezlogs.state SET dropped_total = dropped_total + (SELECT count(*) FROM gone) WHERE one;
+    RETURN 0;
+  END IF;
 
   SELECT net.http_post(
            url                  := ezlogs.endpoint(),
